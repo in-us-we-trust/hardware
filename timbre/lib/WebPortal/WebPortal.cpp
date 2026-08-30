@@ -86,6 +86,33 @@ namespace WebPortal
     {
         bleNameGlobal = bleName;
 
+#ifdef WOKWI_SIM
+        // Wokwi no simula el modo AP: la unica red virtual es "Wokwi-GUEST"
+        // (abierta, canal 6) y el ESP solo puede actuar como estacion. Nos
+        // conectamos ahi y servimos la misma pagina; el host la alcanza por el
+        // port forward declarado en wokwi.toml.
+        WiFi.mode(WIFI_STA);
+        WiFi.begin("Wokwi-GUEST", "", 6);
+        Serial.print("\n[WOKWI] Conectando a Wokwi-GUEST");
+        int attempts = 0;
+        while (WiFi.status() != WL_CONNECTED && attempts < 60)
+        {
+            delay(250);
+            Serial.print(".");
+            attempts++;
+        }
+        Serial.println();
+        if (WiFi.status() != WL_CONNECTED)
+        {
+            Serial.println("[WOKWI] No se pudo conectar a Wokwi-GUEST");
+        }
+        else
+        {
+            Serial.print("[WOKWI] IP simulada: ");
+            Serial.println(WiFi.localIP());
+            Serial.println("[WOKWI] Abri http://localhost:8180");
+        }
+#else
         WiFi.mode(WIFI_AP);
         WiFi.softAP(bleNameGlobal.c_str());
         Serial.println("\nAccess Point iniciado");
@@ -93,6 +120,7 @@ namespace WebPortal
         Serial.println(bleNameGlobal);
         Serial.print("IP: ");
         Serial.println(WiFi.softAPIP());
+#endif
 
         server.on("/", handleRoot);
         server.on("/qr.js", handleQrJs);

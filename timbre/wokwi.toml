@@ -1,0 +1,13 @@
+[wokwi]
+version = 1
+#elf = ".pio/build/wokwi/firmware.elf"
+#firmware = ".pio/build/wokwi/firmware.bin"
+
+elf = ".pio/build/wokwi_provisioned/firmware.elf"
+firmware = ".pio/build/wokwi_provisioned/firmware.bin"
+
+# El puerto 80 del ESP simulado no es alcanzable desde el host sin esto.
+# Con el forward, la pagina del QR queda en http://localhost:8180
+[[net.forward]]
+from = "localhost:8180"
+to = "target:80"
