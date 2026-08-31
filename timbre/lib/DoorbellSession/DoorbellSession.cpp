@@ -2,8 +2,7 @@
 
 #include "Device.h"
 #include "MqttClient.h"
-#include "RtspPublisher.h"
-#include "MockMediaSource.h"
+#include "mbedtls/base64.h"
 
 // --- Config (desde platformio.ini via build_flags, con defaults) -----------
 #ifndef MQTT_BROKER_HOST
@@ -13,62 +12,60 @@
 #define MQTT_BROKER_PORT 1883
 #endif
 #ifndef MEDIAMTX_HOST
-// Host de MediaMTX alcanzable por el gateway. Ajustar al lab real.
 #define MEDIAMTX_HOST "192.168.1.50"
+#endif
+#ifndef MEDIAMTX_PORT
+#define MEDIAMTX_PORT 8554
+#endif
+#ifndef MEDIAMTX_PATH
+#define MEDIAMTX_PATH "doorbell"
 #endif
 
 namespace
 {
-    // Fuente de media para el publisher. Hoy mock (JPEG embebido); en fase C
-    // se cambia por CameraMediaSource. A 10 fps.
-    MockMediaSource mediaSource(10);
-
     String deviceId;
-    String trackId;   // == eventId del press; "" cuando no hay sesion
+    String trackId; // == eventId del press; "" cuando no hay sesion
     bool active = false;
 
-    DoorbellSession::DangerHandler dangerHandler = nullptr;
-    DoorbellSession::MessageHandler messageHandler = nullptr;
+    DoorbellSession::RespuestaHandler respuestaHandler = nullptr;
 
-    // Se invoca con cada ia_response que MqttClient ya filtro por deviceId.
-    // Aca aplicamos el filtro fino por trackId (llamadas solapadas / stale).
+    String rtspUrl()
+    {
+        return String("rtsp://") + MEDIAMTX_HOST + ":" + String(MEDIAMTX_PORT) +
+               "/" + MEDIAMTX_PATH;
+    }
+
+    // Codifica bytes crudos a base64 (para el campo image del press, MQTT).
+    String toBase64(const uint8_t *data, size_t len)
+    {
+        size_t need = 0;
+        mbedtls_base64_encode(nullptr, 0, &need, data, len); // pide tamaño
+        if (need == 0) return "";
+        uint8_t *out = (uint8_t *)malloc(need);
+        if (!out) return "";
+        size_t written = 0;
+        String result;
+        if (mbedtls_base64_encode(out, need, &written, data, len) == 0)
+        {
+            result = String((const char *)out); // mbedtls deja el \0
+        }
+        free(out);
+        return result;
+    }
+
+    // Se invoca con cada ia_response ya filtrado por deviceId (MqttClient).
+    // Aca filtramos por trackId y reenviamos a EventFlow.
     void handleIaResponse(const MqttClient::IaResponse &r)
     {
         if (!active || r.trackId != trackId)
         {
-            // Instruccion de una sesion que no es la activa: se descarta.
             Serial.printf("[SESSION] ia_response ignorado (track=%s, activo=%s)\n",
                           r.trackId.c_str(), trackId.c_str());
             return;
         }
-
-        // Emitir el mensaje hacia arriba (Screen) para cualquier accion.
-        if (messageHandler)
+        if (respuestaHandler)
         {
-            messageHandler(r.chunkType, r.action, r.severity, r.message);
-        }
-
-        if (r.isStopDanger())
-        {
-            Serial.printf("[SESSION] STOP_DANGER (sev=%s): cortando sesion %s\n",
-                          r.severity.c_str(), trackId.c_str());
-            // El gateway YA cerro la sesion de su lado: solo cortamos el media
-            // y disparamos la alerta local. No mandamos stream_end.
-            RtspPublisher::stop();
-            active = false;
-            String finished = trackId;
-            trackId = "";
-            if (dangerHandler)
-            {
-                dangerHandler(r.message);
-            }
-            (void)finished;
-        }
-        else
-        {
-            // CONTINUE: seguir publicando. No hace falta otro press.
-            Serial.printf("[SESSION] CONTINUE (chunk=%s, sev=%s)\n",
-                          r.chunkType.c_str(), r.severity.c_str());
+            respuestaHandler(r);
         }
     }
 }
@@ -80,106 +77,85 @@ namespace DoorbellSession
         deviceId = id;
         active = false;
         trackId = "";
-
-        // Media: configurar el publisher (todavia no publica).
-        RtspPublisher::begin(MEDIAMTX_HOST, &mediaSource);
-
-        // Control: conectar MQTT y quedar escuchando ia_response.
         MqttClient::begin(MQTT_BROKER_HOST, MQTT_BROKER_PORT, deviceId);
         MqttClient::onIaResponse(handleIaResponse);
-
-        Serial.println("[SESSION] lista (MQTT conectando, RTSP configurado)");
+        Serial.println("[SESSION] configurada (MQTT sin conectar aun)");
     }
 
-    String startCall()
+    void onRespuesta(RespuestaHandler handler)
     {
-        if (active)
+        respuestaHandler = handler;
+    }
+
+    void conectar()
+    {
+        MqttClient::conectar();
+    }
+
+    bool estaListo()
+    {
+        return MqttClient::listo();
+    }
+
+    bool enviarFoto(const String &id, const uint8_t *jpeg, size_t len)
+    {
+        String fotoB64 = toBase64(jpeg, len);
+        if (fotoB64.length() == 0)
         {
-            // Contrato: un press nuevo para el mismo deviceId cancela la sesion
-            // anterior. Reemplazamos con un trackId nuevo.
-            Serial.printf("[SESSION] startCall con sesion activa (%s): se reemplaza\n",
-                          trackId.c_str());
+            Serial.println("[SESSION] no se pudo codificar la foto");
+            return false;
         }
+        return enviarFotoBase64(id, fotoB64);
+    }
 
-        // 1) El stream RTSP tiene que estar listo ANTES del press. Si no,
-        //    FFmpeg falla el DESCRIBE (404) y no hay VIDEO/AUDIO.
-        if (!RtspPublisher::isPublishing())
-        {
-            if (!RtspPublisher::start())
-            {
-#ifdef DEV_RTSP_OPTIONAL
-                // Fase de desarrollo (ej. Wokwi, sin MediaMTX alcanzable): no
-                // abortamos, mandamos el press igual para validar el MQTT solo.
-                Serial.println("[SESSION] RTSP no conecto (DEV_RTSP_OPTIONAL): sigo con el press");
-#else
-                Serial.println("[SESSION] no se pudo iniciar RTSP: press abortado");
-                return "";
-#endif
-            }
-        }
-
-        // 2) eventId nuevo = trackId de toda la sesion.
-        trackId = Device::generateUUID();
-        String rtspUrl = RtspPublisher::streamUrl();
-
-        // 3) press por MQTT. Sin imagen: si falta, el gateway saca un frame por
-        //    RTSP (mantiene el payload chico). Bateria informativa opcional.
-        bool ok = MqttClient::publishPress(trackId, rtspUrl);
+    bool enviarFotoBase64(const String &id, const String &fotoBase64)
+    {
+        // El trackId lo genera EventFlow; aca lo guardamos como sesion activa
+        // (para filtrar ia_response) y lo usamos como eventId del press.
+        trackId = id;
+        bool ok = MqttClient::publishPress(trackId, rtspUrl(), fotoBase64);
         if (!ok)
         {
-            Serial.println("[SESSION] press no se pudo publicar; corto RTSP");
-            RtspPublisher::stop();
+            Serial.println("[SESSION] no se pudo publicar el press");
             trackId = "";
-            return "";
+            return false;
         }
 
         active = true;
-        Serial.printf("[SESSION] llamada iniciada trackId=%s\n", trackId.c_str());
-        return trackId;
+        Serial.printf("[SESSION] press enviado (foto base64 %u chars) trackId=%s\n",
+                      (unsigned)fotoBase64.length(), trackId.c_str());
+        return true;
     }
 
-    void endCall()
+    void enviarVideo()
     {
-        if (!active)
-        {
-            return;
-        }
-        Serial.printf("[SESSION] cerrando llamada trackId=%s\n", trackId.c_str());
+        // >>> FASE SIGUIENTE <<<
+        // Aca ira el arranque del track de video en el stream RTSP, de donde el
+        // gateway extrae los VideoChunk.
+        Serial.println("[SESSION] enviarVideo() TODO (RTSP fase siguiente)");
+    }
 
-        // Corte normal / timeout: cortar media y avisar con stream_end.
-        RtspPublisher::stop();
-        MqttClient::publishStreamEnd(trackId);
-        // NOTA fase deep-sleep: antes de dormir hay que asegurar el flush del
-        // PUBACK del stream_end (bombear MqttClient::loop()). Se agrega cuando
-        // metamos el sleep.
+    void enviarAudio()
+    {
+        // >>> FASE SIGUIENTE <<<
+        // Idem para el track de audio (AudioChunk del gateway).
+        Serial.println("[SESSION] enviarAudio() TODO (RTSP fase siguiente)");
+    }
 
+    void cerrarSesion(const String &id)
+    {
+        if (!active) return;
+        MqttClient::publishStreamEnd(id);
+        Serial.printf("[SESSION] sesion cerrada (stream_end) trackId=%s\n",
+                      id.c_str());
         active = false;
         trackId = "";
-    }
-
-    void onDanger(DangerHandler handler)
-    {
-        dangerHandler = handler;
-    }
-
-    void onMessage(MessageHandler handler)
-    {
-        messageHandler = handler;
     }
 
     void loop()
     {
         MqttClient::loop();
-        RtspPublisher::loop();
     }
 
-    bool hasActiveSession()
-    {
-        return active;
-    }
-
-    String currentTrackId()
-    {
-        return trackId;
-    }
+    bool haySesionActiva() { return active; }
 }

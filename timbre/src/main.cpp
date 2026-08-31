@@ -7,49 +7,31 @@
 #include "BleManager.h"
 #include "Certs.h"
 #include "CameraManager.h"
-#include "DoorbellSession.h" // <-- unica capa de comunicacion que ve el main
-#include "Screen.h"           // <-- pantalla de operacion (web + SSE)
+#include "EventFlow.h"       // politica: que y cuando
+#include "Screen.h"          // pantalla de operacion (web + SSE)
+#include "MockMediaSource.h" // fuente de la foto (hardcodeada por ahora)
 
 // ---------------------------------------------------------------------------
-// main.cpp: arranque del timbre + WiFi + (a futuro) deep sleep y boton. Toda
-// la logica del protocolo (MQTT + RTSP + flujo del contrato) vive detras de
-// DoorbellSession. El main no toca los transportes directamente.
+// main.cpp: arranque del timbre. En modo normal levanta las capas de comunica-
+// cion. El flujo del evento vive en EventFlow; el transporte en DoorbellSession.
 //
-// Para probar en Wokwi sin boton fisico: por el monitor serial,
-//   'p' -> startCall() (timbrar)      'e' -> endCall() (terminar la llamada)
+// Prueba en Wokwi sin boton fisico:
+//   'p' -> onTimbre() (toca el timbre)   'e' -> terminar() (cierra la sesion)
 // ---------------------------------------------------------------------------
 
-size_t getArduinoLoopTaskStackSize(void)
-{
-    return 16 * 1024;
-}
+size_t getArduinoLoopTaskStackSize(void) { return 16 * 1024; }
 
 static bool modoNormal = false;
 
-// El gateway ordeno cortar por peligro. Aca iria la alerta local real.
-void onDanger(const String &message)
-{
-    Serial.printf("[APP] ALERTA LOCAL: %s\n", message.c_str());
-    // TODO fase 2: buzzer / luz / notificacion.
-}
-
-// Cada ia_response -> se muestra en la pantalla web.
-void onMessage(const String &chunkType, const String &action,
-               const String &severity, const String &message)
-{
-    String text = "[" + chunkType + "] " + action;
-    if (message.length() > 0) text += " \u2014 " + message;
-    Screen::showMessage(text, severity);
-}
+// Fuente de la foto. Hoy mock (JPEG embebido); manana CameraMediaSource.
+static MockMediaSource fotoSource(1);
 
 void setup()
 {
     Serial.begin(115200);
     unsigned long start = millis();
     while (!Serial && (millis() - start < 4000))
-    {
         delay(10);
-    }
     Serial.println("\nIniciando...");
 
 #ifdef WOKWI_SEED_NVS
@@ -71,13 +53,10 @@ void setup()
 
             String deviceId = Device::getOrCreateDeviceId();
             Serial.printf("[APP] deviceId = %s\n", deviceId.c_str());
-            Serial.println("[APP] serial: 'p' = timbrar (press), 'e' = terminar");
+            Serial.println("[APP] serial: 'p' = timbrar, 'e' = terminar");
 
-            Screen::begin(); // pantalla web (necesita WiFi ya conectado)
-
-            DoorbellSession::begin(deviceId);
-            DoorbellSession::onDanger(onDanger);
-            DoorbellSession::onMessage(onMessage);
+            Screen::begin();                         // pantalla web (necesita WiFi)
+            EventFlow::begin(deviceId, &fotoSource); // politica + transporte + fuente
 
             modoNormal = true;
             return;
@@ -94,33 +73,25 @@ void setup()
 #endif
 }
 
-// Disparo de prueba por serial (reemplaza al boton fisico mientras no lo haya).
+// Disparo de prueba por serial (reemplaza al boton fisico).
 void handleSerialTrigger()
 {
     if (!Serial.available())
-    {
         return;
-    }
     char c = Serial.read();
     if (c == 'p')
-    {
-        DoorbellSession::startCall();
-    }
+        EventFlow::onTimbre();
     else if (c == 'e')
-    {
-        DoorbellSession::endCall();
-    }
+        EventFlow::terminar();
 }
 
 void loop()
 {
     if (modoNormal)
     {
-        DoorbellSession::loop();
-        Screen::handleClient();
+        EventFlow::loop();
+        Screen::handleClient(); // atiende la pagina web
         handleSerialTrigger();
-        // A futuro: aca va el boton fisico -> DoorbellSession::startCall()
-        // y el deep sleep cuando la sesion termina.
     }
     else
     {

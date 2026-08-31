@@ -22,6 +22,68 @@
 //
 // El broker en el lab es plano (tcp://host:1883, sin TLS ni auth). El mTLS del
 // proyecto es solo para el ApiClient HTTPS, no para MQTT.
+//
+// ===========================================================================
+// PAYLOADS EXACTOS (lo que sale del cable, tal cual lo arma este modulo)
+// ===========================================================================
+// Todos los payloads son un unico objeto JSON UTF-8, sin espacios ni saltos
+// (serializeJson compacto), publicado con QoS 1 y retain=false.
+//
+// Campos comunes:
+//   deviceId   string  - Device::getOrCreateDeviceId(). Siempre presente.
+//   timestamp  int64   - epoch en MILISEGUNDOS UTC. SE OMITE si el reloj no
+//                        esta sincronizado por NTP (time(nullptr) < 2020-09).
+//                        O sea: el gateway no puede asumir que exista.
+//
+// --- home/doorbell/events/press --------------------------------------------
+// Lo publica publishPress(). Campos:
+//   eventId            string  - id de esta llamada; ES el trackId de la sesion.
+//   deviceId           string
+//   event              string  - literal constante "press".
+//   rtspUrl            string  - siempre presente (puede venir vacio si el
+//                                llamador pasa ""); no se valida aca.
+//   timestamp          int64   - opcional (ver arriba).
+//   image              string  - opcional; JPEG en Base64 SIN prefijo data:.
+//                                Solo si imageBase64 != "". Ojo MQTT_BUFFER_SIZE.
+//   batteryPercentage  float   - opcional; solo si no es NAN.
+//
+// {"eventId":"evt-7f3a","deviceId":"esp32-a1b2c3","event":"press",
+//  "rtspUrl":"rtsp://192.168.0.42:8554/timbre","timestamp":1756512000000,
+//  "batteryPercentage":87.5}
+//
+// --- home/doorbell/events/stream_end ---------------------------------------
+// Lo publica publishStreamEnd(). Campos:
+//   trackId    string  - == eventId del press de esta sesion.
+//   deviceId   string
+//   timestamp  int64   - opcional.
+// NO lleva "event" ni "rtspUrl".
+//
+// {"trackId":"evt-7f3a","deviceId":"esp32-a1b2c3","timestamp":1756512045000}
+//
+// --- home/doorbell/events/capture_image ------------------------------------
+// --- home/doorbell/events/capture_audio ------------------------------------
+// Los publican publishCaptureImage() / publishCaptureAudio(). Mismo shape los
+// dos, cambia solo el topic. Campos:
+//   deviceId   string  - unico obligatorio.
+//   trackId    string  - opcional; solo si se paso != "".
+//   rtspUrl    string  - opcional; solo si se paso != "".
+//   timestamp  int64   - opcional.
+// NO llevan "event". El payload minimo posible es {"deviceId":"..."}.
+//
+// {"deviceId":"esp32-a1b2c3","trackId":"evt-7f3a",
+//  "rtspUrl":"rtsp://192.168.0.42:8554/timbre","timestamp":1756512010000}
+//
+// --- home/doorbell/events/ia_response (ENTRADA, no lo publicamos) ----------
+// Se espera un objeto con: trackId, deviceId, chunkType, action, severity,
+// message (todos string). Los que falten quedan como "" en IaResponse. Si el
+// deviceId viene y no es el nuestro, el mensaje se descarta sin llamar al
+// handler.
+//
+// {"trackId":"evt-7f3a","deviceId":"esp32-a1b2c3","chunkType":"IMAGE",
+//  "action":"CONTINUE","severity":"NORMAL","message":"Persona conocida"}
+//
+// Nota: si no hay conexion al broker, el publish se descarta (se loguea y
+// devuelve false); no hay cola local ni reintento del mensaje.
 // ---------------------------------------------------------------------------
 
 namespace MqttClient
@@ -58,8 +120,16 @@ namespace MqttClient
     // mensajes entrantes. Llamar en cada vuelta del loop() principal.
     void loop();
 
-    // true si hay sesion MQTT activa con el broker.
+    // true si hay sesion MQTT activa con el broker (TCP+CONNECT).
     bool connected();
+
+    // Dispara la conexion al broker (no bloquea). El resultado se resuelve en
+    // loop(). Antes de esto, begin() solo configura pero no conecta.
+    void conectar();
+
+    // true cuando esta LISTO para publicar/recibir: conectado Y suscripto a
+    // ia_response. Usar esto (no connected()) antes de mandar el press.
+    bool listo();
 
     // --- Publicaciones (todas QoS 1, sin retain) ---------------------------
 

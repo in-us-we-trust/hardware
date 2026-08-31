@@ -42,7 +42,9 @@ namespace
 
     MqttClient::IaResponseHandler iaHandler = nullptr;
 
-    bool started = false;
+    bool started = false;    // configurado (begin llamado)
+    bool enabled = false;    // debe estar conectado (conectar llamado)
+    bool subscribed = false; // suscripto a ia_response
     unsigned long lastConnectAttempt = 0;
 
     // Epoch en milisegundos UTC, o 0 si el reloj todavia no esta sincronizado
@@ -76,10 +78,10 @@ namespace
         r.message = doc["message"] | "";
 
         // Filtrado por deviceId: ignorar instrucciones de otros timbres.
-        // if (r.deviceId.length() > 0 && r.deviceId != deviceId)
-        // {
-        //     return;
-        // }
+        if (r.deviceId.length() > 0 && r.deviceId != deviceId)
+        {
+            return;
+        }
 
         Serial.printf("[MQTT] ia_response track=%s chunk=%s action=%s sev=%s\n",
                       r.trackId.c_str(), r.chunkType.c_str(),
@@ -136,7 +138,7 @@ namespace
         if (mqtt.connect(clientId.c_str()))
         {
             Serial.println("[MQTT] conectado");
-            mqtt.subscribe(TOPIC_IA_RESPONSE, 1);
+            subscribed = mqtt.subscribe(TOPIC_IA_RESPONSE, 1);
             Serial.printf("[MQTT] suscripto a %s (QoS 1)\n", TOPIC_IA_RESPONSE);
         }
         else
@@ -163,7 +165,7 @@ namespace MqttClient
         mqtt.onMessage(onMessage);
 
         started = true;
-        connectNow();
+        enabled = false; // no conecta hasta que se llame a conectar()
     }
 
     void onIaResponse(IaResponseHandler handler)
@@ -180,7 +182,12 @@ namespace MqttClient
 
         mqtt.loop();
 
-        if (!mqtt.connected() &&
+        if (!mqtt.connected())
+        {
+            subscribed = false; // si se cayo, ya no estamos suscriptos
+        }
+
+        if (enabled && !mqtt.connected() &&
             (millis() - lastConnectAttempt) > MQTT_RECONNECT_INTERVAL_MS)
         {
             connectNow();
@@ -190,6 +197,19 @@ namespace MqttClient
     bool connected()
     {
         return started && mqtt.connected();
+    }
+
+    void conectar()
+    {
+        if (!started) return;
+        enabled = true;
+        connectNow(); // dispara el intento; el resultado se resuelve en loop()
+    }
+
+    bool listo()
+    {
+        // Listo para publicar/recibir: conectado Y suscripto a ia_response.
+        return enabled && mqtt.connected() && subscribed;
     }
 
     bool publishPress(

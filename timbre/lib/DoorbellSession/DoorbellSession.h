@@ -1,60 +1,62 @@
 #pragma once
 #include <Arduino.h>
+#include "MqttClient.h" // para IaResponse
 
 // ---------------------------------------------------------------------------
-// DoorbellSession: orquestador de la sesion de timbre. Es la UNICA capa que
-// entiende el flujo del contrato (press -> ia_response -> stream_end, TTL,
-// STOP_DANGER) y coordina los transportes por debajo: MqttClient (control) y
-// RtspPublisher (media).
+// DoorbellSession: MECANISMO. Sabe COMO mandar y recibir, no decide QUE ni
+// CUANDO. Expone primitivas que usa la capa de politica (EventFlow):
+//   - enviarFoto(jpeg): abre la sesion publicando el press con la foto.
+//   - enviarVideo()/enviarAudio(): plano de media por RTSP (fase siguiente).
+//   - cerrarSesion(): stream_end.
+//   - onRespuesta(cb): notifica cada ia_response valido para que EventFlow
+//     decida.
 //
-// El main NO deberia hablar con MqttClient ni RtspPublisher directamente: solo
-// con esta capa. DoorbellSession, a su vez, NO maneja WiFi ni deep sleep: asume
-// que ya hay red. Esa frontera es lo que la mantiene limpia.
-//
-//   main  --startCall()/endCall()/onDanger()-->  DoorbellSession
-//   DoorbellSession  -->  MqttClient  +  RtspPublisher
+// No saca la foto de ninguna fuente: la recibe ya lista. Quien la obtiene es
+// la capa de arriba.
 // ---------------------------------------------------------------------------
 
 namespace DoorbellSession
 {
-    // Callback cuando el gateway ordena cortar por peligro (STOP_DANGER).
-    // Aca el main dispara la alerta local (buzzer, luz, lo que sea).
-    typedef void (*DangerHandler)(const String &message);
+    // Callback para cada ia_response valido (de la sesion activa).
+    typedef void (*RespuestaHandler)(const MqttClient::IaResponse &r);
 
-    // Callback para CADA ia_response valido (de la sesion activa), sin importar
-    // la accion. Lo usa el main para mostrarlo en la Screen. Strings sueltos
-    // para no acoplar Screen/main al transporte MQTT.
-    typedef void (*MessageHandler)(const String &chunkType, const String &action,
-                                   const String &severity, const String &message);
-
-    // Arranca los transportes: conecta MQTT (queda escuchando ia_response) y
-    // configura el RtspPublisher. Llamar una vez, en modo normal con WiFi.
-    // La config del broker y de MediaMTX viene de build flags (platformio.ini).
+    // Configura el transporte (MQTT). NO conecta todavia: la conexion se
+    // dispara con conectar(). Llamar una vez, en modo normal con WiFi.
     void begin(const String &deviceId);
 
-    // Dispara una llamada: deja el stream RTSP listo, publica el press y abre
-    // la sesion. Devuelve el trackId (== eventId) de la sesion, o "" si fallo.
-    // Un startCall con sesion activa reemplaza la anterior (trackId nuevo).
-    String startCall();
+    // Dispara la conexion al broker (no bloquea). Se resuelve en loop().
+    void conectar();
 
-    // Cierra la llamada activa "por corte normal / timeout": corta el RTSP y
-    // publica stream_end con el trackId de la sesion. No hace nada si no hay
-    // sesion activa.
-    void endCall();
+    // true cuando el transporte esta listo para mandar/recibir (conectado y
+    // suscripto). EventFlow espera esto antes de enviar el press.
+    bool estaListo();
 
-    // Registra el handler de peligro. Opcional.
-    void onDanger(DangerHandler handler);
+    // Registra el handler que recibe cada ia_response. Lo usa EventFlow.
+    void onRespuesta(RespuestaHandler handler);
 
-    // Registra el handler de mensajes (todo ia_response). Opcional.
-    void onMessage(MessageHandler handler);
+    // Abre la sesion: publica el press con la PRIMERA foto. El trackId lo
+    // genera y es dueño EventFlow; aca lo recibimos, lo guardamos como sesion
+    // activa (para filtrar ia_response) y lo usamos como eventId del press.
+    // (JPEG crudo; se codifica a base64 adentro, detalle de transporte MQTT.)
+    // Devuelve true si el press salio.
+    bool enviarFoto(const String &trackId, const uint8_t *jpeg, size_t len);
 
-    // Bombeo: adentro llama a MqttClient::loop() y RtspPublisher::loop().
-    // Imprescindible en cada vuelta del loop() principal.
+    // Igual que enviarFoto pero recibe la foto YA codificada en base64 (para
+    // una constante hardcodeada de prueba, sin pasar por la fuente).
+    bool enviarFotoBase64(const String &trackId, const String &fotoBase64);
+
+    // --- Placeholders: plano de media por RTSP (fase siguiente) ------------
+    // El audio y el video NO se mandan como blobs: van por el stream RTSP y el
+    // gateway los extrae en chunks (ExtractVideoChunk/ExtractAudioChunk). Estas
+    // primitivas controlaran el stream cuando lo implementemos.
+    void enviarVideo();
+    void enviarAudio();
+
+    // Cierra la sesion: publica stream_end con el trackId que le pasa EventFlow.
+    void cerrarSesion(const String &trackId);
+
+    // Bombeo MQTT. Llamar en cada vuelta del loop() principal.
     void loop();
 
-    // true si hay una sesion de timbre en curso.
-    bool hasActiveSession();
-
-    // trackId de la sesion activa ("" si no hay).
-    String currentTrackId();
+    bool haySesionActiva();
 }
