@@ -4,7 +4,7 @@
 #include "Device.h"
 #include "Storage.h"
 #include "ApiClient.h"
-#include "CameraManager.h"
+#include "CameraSource.h"
 
 #include <BLEDevice.h>
 #include <BLEServer.h>
@@ -188,7 +188,7 @@ namespace BleManager
             }
 
             lastEventSentAt = millis();
-            String imageBase64 = CameraManager::captureImageBase64();
+            String imageBase64 = Camera.captureBase64();
             if (imageBase64.isEmpty())
             {
                 WebPortal::sendSSE(" No se pudo capturar imagen para events");
@@ -272,7 +272,6 @@ namespace BleManager
             {
                 WebPortal::sendSSE("WiFi OK pero fallo el registro en el gateway.");
             }
-
         }
         else
         {

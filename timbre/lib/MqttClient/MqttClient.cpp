@@ -24,6 +24,19 @@
 #define MQTT_RECONNECT_INTERVAL_MS 3000
 #endif
 
+// Timeout de la conexion TCP/CONNACK. Bajo, para que un broker caido no cuelgue
+// el loop principal (que ademas atiende el stream local).
+#ifndef MQTT_CONNECT_TIMEOUT_MS
+#define MQTT_CONNECT_TIMEOUT_MS 2000
+#endif
+
+// Cuantos intentos fallidos seguidos antes de abandonar el backend. Tras esto
+// se deja de reintentar (para no trabar el stream local) hasta el proximo
+// conectar() -- es decir, hasta el proximo timbre.
+#ifndef MQTT_MAX_CONNECT_ATTEMPTS
+#define MQTT_MAX_CONNECT_ATTEMPTS 2
+#endif
+
 namespace
 {
     const char *TOPIC_PRESS = "home/doorbell/events/press";
@@ -46,6 +59,7 @@ namespace
     bool enabled = false;    // debe estar conectado (conectar llamado)
     bool subscribed = false; // suscripto a ia_response
     unsigned long lastConnectAttempt = 0;
+    int connectAttempts = 0; // fallos seguidos; al llegar al max, abandona
 
     // Epoch en milisegundos UTC, o 0 si el reloj todavia no esta sincronizado
     // por NTP (WifiManager::connect hace la sincro).
@@ -131,20 +145,32 @@ namespace
         }
 
         lastConnectAttempt = millis();
-        Serial.printf("[MQTT] conectando a %s:%u como %s...\n",
-                      brokerHost.c_str(), brokerPort, clientId.c_str());
+        Serial.printf("[MQTT] conectando a %s:%u como %s... (intento %d/%d)\n",
+                      brokerHost.c_str(), brokerPort, clientId.c_str(),
+                      connectAttempts + 1, MQTT_MAX_CONNECT_ATTEMPTS);
 
         // Lab: broker plano sin auth. Para user/pass usar connect(id, user, pass).
         if (mqtt.connect(clientId.c_str()))
         {
+            connectAttempts = 0;
             Serial.println("[MQTT] conectado");
             subscribed = mqtt.subscribe(TOPIC_IA_RESPONSE, 1);
             Serial.printf("[MQTT] suscripto a %s (QoS 1)\n", TOPIC_IA_RESPONSE);
         }
         else
         {
+            connectAttempts++;
             Serial.printf("[MQTT] conexion fallo (err=%d, ret=%d)\n",
-                          mqtt.lastError(), mqtt.returnCode());
+                        mqtt.lastError(), mqtt.returnCode());
+
+            if (connectAttempts >= MQTT_MAX_CONNECT_ATTEMPTS)
+            {
+                // Broker inalcanzable: dejamos de reintentar para no trabar el
+                // stream local. Se reintenta en el proximo conectar() (timbre).
+                enabled = false;
+                Serial.println("[MQTT] broker inalcanzable, abandono el backend "
+                            "(el stream local sigue)");
+            }
         }
     }
 }
@@ -158,10 +184,14 @@ namespace MqttClient
         deviceId = id;
         clientId = "timbre-" + id; // unico por dispositivo; nunca "gateway-micro"
 
+        // Timeout de la conexion TCP: si el broker no responde, no queremos que
+        // WiFiClient::connect() cuelgue el loop por varios segundos.
+        
         mqtt.begin(brokerHost.c_str(), brokerPort, net);
         mqtt.setKeepAlive(MQTT_KEEPALIVE_SECONDS);
         // cleanSession=true: no queremos cola persistente del lado del broker.
-        mqtt.setOptions(MQTT_KEEPALIVE_SECONDS, true, 5000);
+        // El 3er parametro es el timeout de comandos/CONNACK (antes 5000).
+        mqtt.setOptions(MQTT_KEEPALIVE_SECONDS, true, MQTT_CONNECT_TIMEOUT_MS);
         mqtt.onMessage(onMessage);
 
         started = true;
@@ -201,9 +231,22 @@ namespace MqttClient
 
     void conectar()
     {
-        if (!started) return;
+        if (!started)
+            return;
         enabled = true;
-        connectNow(); // dispara el intento; el resultado se resuelve en loop()
+        connectAttempts = 0; // cada evento arranca con los intentos frescos
+        connectNow();        // dispara el intento; el resultado se resuelve en loop()
+    }
+
+    void desconectar()
+    {
+        enabled = false;
+        connectAttempts = 0;
+        subscribed = false;
+        if (mqtt.connected())
+        {
+            mqtt.disconnect();
+        }
     }
 
     bool listo()

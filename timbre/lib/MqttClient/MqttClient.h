@@ -127,6 +127,11 @@ namespace MqttClient
     // loop(). Antes de esto, begin() solo configura pero no conecta.
     void conectar();
 
+    // Deja de reintentar y cierra la conexion si estaba abierta. Se vuelve a
+    // intentar con el proximo conectar(). Tambien se auto-invoca internamente
+    // tras MQTT_MAX_CONNECT_ATTEMPTS fallos, para no trabar el stream local.
+    void desconectar();
+
     // true cuando esta LISTO para publicar/recibir: conectado Y suscripto a
     // ia_response. Usar esto (no connected()) antes de mandar el press.
     bool listo();

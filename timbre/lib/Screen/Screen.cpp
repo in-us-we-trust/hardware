@@ -15,16 +15,32 @@ namespace
     String lastText = "";
     String lastSev = "NORMAL";
 
-    // Pagina de operacion: lista de mensajes que se van agregando por SSE.
+    // Pagina UNIFICADA de operacion: stream de la camara + mensajes en vivo
+    // (SSE) + boton colgar. Todo apunta al MISMO host desde el que se cargo la
+    // pagina (location.hostname), asi no depende de una IP hardcodeada:
+    //   - video   -> http://<host>:8081/stream  (polling)
+    //   - colgar  -> http://<host>:8081/hangup
+    //   - mensajes-> /events (SSE, este mismo server :80)
     const char PAGE[] PROGMEM = R"HTML(
 <!DOCTYPE html><html><head><meta charset='utf-8'>
 <meta name='viewport' content='width=device-width,initial-scale=1'>
-<title>Timbre - Mensajes</title>
+<title>Timbre</title>
 <style>
 body{font-family:system-ui,Arial;margin:0;background:#0f1115;color:#e6e6e6;}
 header{padding:16px 20px;background:#171a21;font-size:18px;font-weight:600;
- border-bottom:1px solid #262b36;}
-#log{padding:16px 20px;display:flex;flex-direction:column;gap:8px;}
+ border-bottom:1px solid #262b36;display:flex;justify-content:space-between;
+ align-items:center;gap:12px;}
+#status{font-size:13px;color:#8a90a0;font-weight:400;}
+#hangup{background:#e5484d;color:#fff;border:0;border-radius:8px;
+ padding:8px 16px;font-size:14px;font-weight:600;cursor:pointer;}
+#hangup:hover{background:#c93b40;}
+main{padding:16px 20px;display:flex;flex-direction:column;gap:16px;
+ max-width:720px;margin:0 auto;}
+#video{width:100%;border-radius:10px;background:#000;display:block;
+ aspect-ratio:4/3;object-fit:contain;}
+#novideo{color:#6a7080;text-align:center;padding:40px;background:#171a21;
+ border-radius:10px;}
+#log{display:flex;flex-direction:column;gap:8px;}
 .msg{padding:10px 14px;border-radius:8px;background:#171a21;
  border-left:4px solid #3a3f4b;white-space:pre-wrap;}
 .msg .t{font-size:12px;color:#8a90a0;margin-bottom:2px;}
@@ -34,19 +50,57 @@ header{padding:16px 20px;background:#171a21;font-size:18px;font-weight:600;
 .sev-NORMAL{border-left-color:#30a46c;}
 #empty{color:#6a7080;padding:20px;}
 </style></head><body>
-<header>Timbre &middot; Mensajes en vivo</header>
-<div id='log'><div id='empty'>Esperando mensajes del gateway...</div></div>
+<header>
+  <span>Timbre <span id='status'></span></span>
+  <button id='hangup'>Colgar</button>
+</header>
+<main>
+  <img id='video' alt='stream'>
+  <div id='novideo' style='display:none'>Sin video (timbre en reposo)</div>
+  <div id='log'><div id='empty'>Esperando mensajes del gateway...</div></div>
+</main>
 <script>
+var host = location.hostname;
+var streamBase = 'http://' + host + ':8081';
+
+// --- Video: polling del /stream cada 250ms ---
+var img = document.getElementById('video');
+var novideo = document.getElementById('novideo');
+var fails = 0;
+function tick(){
+  var url = streamBase + '/stream?t=' + Date.now();
+  var probe = new Image();
+  probe.onload = function(){
+    fails = 0;
+    img.src = probe.src;
+    img.style.display = 'block';
+    novideo.style.display = 'none';
+  };
+  probe.onerror = function(){
+    fails++;
+    if(fails > 3){ img.style.display='none'; novideo.style.display='block'; }
+  };
+  probe.src = url;
+}
+setInterval(tick, 250);
+tick();
+
+// --- Colgar ---
+document.getElementById('hangup').onclick = function(){
+  fetch(streamBase + '/hangup').catch(function(){});
+};
+
+// --- Mensajes del backend (SSE) ---
 function add(sev,text){
-  var e=document.getElementById('empty'); if(e) e.remove();
   var log=document.getElementById('log');
-  var d=document.createElement('div'); d.className='msg sev-'+sev;
   var t=new Date().toLocaleTimeString();
+  log.innerHTML='';
+  var d=document.createElement('div'); d.className='msg sev-'+sev;
   var head=document.createElement('div'); head.className='t';
   head.textContent=t+' \u00b7 '+sev;
   var body=document.createElement('div'); body.textContent=text;
   d.appendChild(head); d.appendChild(body);
-  log.insertBefore(d, log.firstChild);
+  log.appendChild(d);
 }
 var es=new EventSource('/events');
 es.onmessage=function(e){
@@ -62,10 +116,20 @@ es.onmessage=function(e){
         for (size_t i = 0; i < s.length(); i++)
         {
             char c = s[i];
-            if (c == '"' || c == '\\') { o += '\\'; o += c; }
-            else if (c == '\n') { o += "\\n"; }
-            else if (c == '\r') { /* drop */ }
-            else o += c;
+            if (c == '"' || c == '\\')
+            {
+                o += '\\';
+                o += c;
+            }
+            else if (c == '\n')
+            {
+                o += "\\n";
+            }
+            else if (c == '\r')
+            { /* drop */
+            }
+            else
+                o += c;
         }
         return o;
     }
@@ -97,7 +161,8 @@ es.onmessage=function(e){
             "Access-Control-Allow-Origin: *\r\n"
             "\r\n");
         // Al abrir/recargar, mandamos el ultimo mensaje conocido.
-        if (lastText.length() > 0) pushSse(lastSev, lastText);
+        if (lastText.length() > 0)
+            pushSse(lastSev, lastText);
     }
 }
 
@@ -115,12 +180,14 @@ namespace Screen
 
     void handleClient()
     {
-        if (started) server.handleClient();
+        if (started)
+            server.handleClient();
     }
 
     void stop()
     {
-        if (!started) return;
+        if (!started)
+            return;
         server.stop();
         started = false;
         sseConnected = false;
