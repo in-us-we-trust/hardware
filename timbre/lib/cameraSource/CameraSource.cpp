@@ -6,13 +6,11 @@
 
 namespace
 {
-    // Seeed XIAO ESP32S3 Sense camera pins
     #define PWDN_GPIO_NUM  -1
     #define RESET_GPIO_NUM -1
     #define XCLK_GPIO_NUM  10
     #define SIOD_GPIO_NUM  40
     #define SIOC_GPIO_NUM  39
-
     #define Y9_GPIO_NUM 48
     #define Y8_GPIO_NUM 11
     #define Y7_GPIO_NUM 12
@@ -21,16 +19,20 @@ namespace
     #define Y4_GPIO_NUM 18
     #define Y3_GPIO_NUM 17
     #define Y2_GPIO_NUM 15
-
     #define VSYNC_GPIO_NUM 38
     #define HREF_GPIO_NUM  47
     #define PCLK_GPIO_NUM  13
 }
 
+CameraSource::CameraSource(int fps) : _fps(fps)
+{
+    _mutex = xSemaphoreCreateMutex();
+}
+
 bool CameraSource::begin()
 {
     if (_ready)
-        return true; // ya inicializada
+        return true;
 
     camera_config_t config;
     config.ledc_channel = LEDC_CHANNEL_0;
@@ -56,15 +58,14 @@ bool CameraSource::begin()
 
     if (psramFound())
     {
-        config.frame_size = FRAMESIZE_VGA; // 640x480 (antes QVGA 320x240)
-        config.jpeg_quality = 12;          // 10-63: menor = mejor (mas pesado)
-        config.fb_count = 2;               // stream local + RTSP piden frames
+        config.frame_size = FRAMESIZE_VGA;
+        config.jpeg_quality = 12;
+        config.fb_count = 2;
         config.fb_location = CAMERA_FB_IN_PSRAM;
         config.grab_mode = CAMERA_GRAB_LATEST;
     }
     else
     {
-        // Sin PSRAM no conviene VGA; caemos a QVGA para no quedarnos sin RAM.
         config.frame_size = FRAMESIZE_QVGA;
         config.jpeg_quality = 12;
         config.fb_count = 2;
@@ -78,33 +79,24 @@ bool CameraSource::begin()
         return false;
     }
 
-    // Ajustes del sensor (OV2640). Valores de arranque orientados a poca luz;
-    // ajustar EN VIVO mirando el stream (lo ideal cambia con la escena/luz).
     sensor_t *s = esp_camera_sensor_get();
     if (s)
     {
-        // --- Orientacion (corrige el "de cabeza"): probar 0/1 en cada uno ---
         s->set_vflip(s, 1);
         s->set_hmirror(s, 0);
-
-        // --- Luz / exposicion (tu escena sale oscura) ---
-        s->set_brightness(s, 1);                 // -2..2  (+1 aclara)
-        s->set_ae_level(s, 1);                   // -2..2  exposicion
-        s->set_aec2(s, 1);                       // control de exposicion mejorado
-        s->set_gainceiling(s, GAINCEILING_16X);  // mas ganancia en penumbra
-        s->set_denoise(s, 1);                    // baja el ruido de la ganancia
-
-        // --- Color / balance de blancos (sale verdoso) ---
+        s->set_brightness(s, 1);
+        s->set_ae_level(s, 1);
+        s->set_aec2(s, 1);
+        s->set_gainceiling(s, GAINCEILING_16X);
+        s->set_denoise(s, 1);
         s->set_whitebal(s, 1);
         s->set_awb_gain(s, 1);
-        s->set_saturation(s, 0);                 // -2..2
-
-        // --- Nitidez / correcciones ---
-        s->set_contrast(s, 1);                   // -2..2
-        s->set_sharpness(s, 1);                  // -2..2
-        s->set_lenc(s, 1);                       // correccion de lente (bordes)
-        s->set_bpc(s, 1);                        // correccion pixeles negros
-        s->set_wpc(s, 1);                        // correccion pixeles blancos
+        s->set_saturation(s, 0);
+        s->set_contrast(s, 1);
+        s->set_sharpness(s, 1);
+        s->set_lenc(s, 1);
+        s->set_bpc(s, 1);
+        s->set_wpc(s, 1);
     }
 
     _ready = true;
@@ -120,15 +112,18 @@ void CameraSource::end()
         _ready = false;
         Serial.println("[CAM] apagada");
     }
+    xSemaphoreTake(_mutex, portMAX_DELAY);
     if (_buf)
     {
-        free(_buf); // libera la copia para no retener PSRAM en reposo
+        free(_buf);
         _buf = nullptr;
         _cap = 0;
         _len = 0;
     }
+    xSemaphoreGive(_mutex);
 }
 
+// Captura y copia al buffer interno. NO toma mutex (el caller lo hace).
 bool CameraSource::captureIntoBuffer()
 {
     if (!_ready)
@@ -141,7 +136,6 @@ bool CameraSource::captureIntoBuffer()
         return false;
     }
 
-    // Aseguramos capacidad y copiamos, para devolver el fb enseguida.
     if (_cap < fb->len)
     {
         uint8_t *nb = (uint8_t *)(psramFound()
@@ -159,28 +153,57 @@ bool CameraSource::captureIntoBuffer()
 
     memcpy(_buf, fb->buf, fb->len);
     _len = fb->len;
-    esp_camera_fb_return(fb); // devolvemos el framebuffer de inmediato
+    esp_camera_fb_return(fb);
     return true;
 }
 
 bool CameraSource::nextVideoFrame(const uint8_t **data, size_t *len)
 {
-    if (!captureIntoBuffer())
-        return false;
-    *data = _buf;
-    *len = _len;
-    return true;
+    xSemaphoreTake(_mutex, portMAX_DELAY);
+    bool ok = captureIntoBuffer();
+    if (ok)
+    {
+        *data = _buf;
+        *len = _len;
+    }
+    xSemaphoreGive(_mutex);
+    return ok;
+}
+
+// Captura y copia al buffer DEL CALLER. Pensado para el task MJPEG: el caller
+// puede escribir al socket (lento) sin retener el mutex.
+bool CameraSource::captureFrameCopy(uint8_t *dest, size_t destCap, size_t *outLen)
+{
+    xSemaphoreTake(_mutex, portMAX_DELAY);
+    bool ok = captureIntoBuffer();
+    if (ok && _len <= destCap)
+    {
+        memcpy(dest, _buf, _len);
+        *outLen = _len;
+    }
+    else
+    {
+        ok = false;
+    }
+    xSemaphoreGive(_mutex);
+    return ok;
 }
 
 String CameraSource::captureBase64()
 {
-    if (!captureIntoBuffer())
+    xSemaphoreTake(_mutex, portMAX_DELAY);
+    bool ok = captureIntoBuffer();
+    if (!ok)
+    {
+        xSemaphoreGive(_mutex);
         return "";
+    }
 
     size_t outputLen = 4 * ((_len + 2) / 3);
     char *output = (char *)malloc(outputLen + 1);
     if (!output)
     {
+        xSemaphoreGive(_mutex);
         Serial.println("[CAM] sin memoria para base64");
         return "";
     }
@@ -188,6 +211,8 @@ String CameraSource::captureBase64()
     size_t actualLen = 0;
     int rc = mbedtls_base64_encode(
         (unsigned char *)output, outputLen + 1, &actualLen, _buf, _len);
+    xSemaphoreGive(_mutex);
+
     if (rc != 0)
     {
         free(output);
@@ -201,5 +226,4 @@ String CameraSource::captureBase64()
     return encoded;
 }
 
-// Instancia global: unico dueño de la camara. 5 fps objetivo para el RTSP.
 CameraSource Camera(5);

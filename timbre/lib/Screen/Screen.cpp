@@ -7,20 +7,17 @@ namespace
     WebServer server(80);
     bool started = false;
 
-    // SSE: un solo cliente (la pagina abierta), igual que WebPortal.
     WiFiClient sseClient;
     bool sseConnected = false;
 
-    // Ultimo mensaje, para mostrarlo apenas se abre/recarga la pagina.
     String lastText = "";
     String lastSev = "NORMAL";
 
-    // Pagina UNIFICADA de operacion: stream de la camara + mensajes en vivo
-    // (SSE) + boton colgar. Todo apunta al MISMO host desde el que se cargo la
-    // pagina (location.hostname), asi no depende de una IP hardcodeada:
-    //   - video   -> http://<host>:8081/stream  (polling)
-    //   - colgar  -> http://<host>:8081/hangup
-    //   - mensajes-> /events (SSE, este mismo server :80)
+    void (*hangupCb)() = nullptr;
+
+    // Pagina UNIFICADA: stream MJPEG + mensajes SSE + boton colgar.
+    // El stream viene de :8081 (MJPEG continuo, core 0). El /hangup esta en
+    // este mismo server (:80, mismo origen, sin CORS).
     const char PAGE[] PROGMEM = R"HTML(
 <!DOCTYPE html><html><head><meta charset='utf-8'>
 <meta name='viewport' content='width=device-width,initial-scale=1'>
@@ -39,7 +36,7 @@ main{padding:16px 20px;display:flex;flex-direction:column;gap:16px;
 #video{width:100%;border-radius:10px;background:#000;display:block;
  aspect-ratio:4/3;object-fit:contain;}
 #novideo{color:#6a7080;text-align:center;padding:40px;background:#171a21;
- border-radius:10px;}
+ border-radius:10px;display:none;}
 #log{display:flex;flex-direction:column;gap:8px;}
 .msg{padding:10px 14px;border-radius:8px;background:#171a21;
  border-left:4px solid #3a3f4b;white-space:pre-wrap;}
@@ -56,38 +53,33 @@ main{padding:16px 20px;display:flex;flex-direction:column;gap:16px;
 </header>
 <main>
   <img id='video' alt='stream'>
-  <div id='novideo' style='display:none'>Sin video (timbre en reposo)</div>
+  <div id='novideo'>Sin video (timbre en reposo)</div>
   <div id='log'><div id='empty'>Esperando mensajes del gateway...</div></div>
 </main>
 <script>
 var host = location.hostname;
-var streamBase = 'http://' + host + ':8081';
-
-// --- Video: polling del /stream cada 250ms ---
 var img = document.getElementById('video');
 var novideo = document.getElementById('novideo');
-var fails = 0;
-function tick(){
-  var url = streamBase + '/stream?t=' + Date.now();
-  var probe = new Image();
-  probe.onload = function(){
-    fails = 0;
-    img.src = probe.src;
-    img.style.display = 'block';
-    novideo.style.display = 'none';
-  };
-  probe.onerror = function(){
-    fails++;
-    if(fails > 3){ img.style.display='none'; novideo.style.display='block'; }
-  };
-  probe.src = url;
-}
-setInterval(tick, 250);
-tick();
 
-// --- Colgar ---
+// --- Video: MJPEG continuo desde :8081 ---
+var streamUrl = 'http://' + host + ':8081/';
+img.src = streamUrl;
+img.onload = function(){ img.style.display='block'; novideo.style.display='none'; };
+img.onerror = function(){ img.style.display='none'; novideo.style.display='block'; };
+
+// Retry: si el stream se corto (hangup) y vuelve (nuevo timbre), reconectar.
+setInterval(function(){
+  if(img.style.display==='none'){
+    img.src = '';
+    img.src = streamUrl + '?t=' + Date.now();
+  }
+}, 2000);
+
+// --- Colgar: /hangup esta en :80 (mismo origen, sin CORS) ---
 document.getElementById('hangup').onclick = function(){
-  fetch(streamBase + '/hangup').catch(function(){});
+  fetch('/hangup').then(function(){
+    img.style.display='none'; novideo.style.display='block';
+  }).catch(function(){});
 };
 
 // --- Mensajes del backend (SSE) ---
@@ -104,7 +96,15 @@ function add(sev,text){
 }
 var es=new EventSource('/events');
 es.onmessage=function(e){
-  try{var o=JSON.parse(e.data); add(o.sev||'NORMAL', o.text||'');}catch(err){}
+  try{
+    var o=JSON.parse(e.data);
+    if(o.clear){
+      document.getElementById('log').innerHTML=
+        '<div id="empty">Esperando mensajes del gateway...</div>';
+      return;
+    }
+    add(o.sev||'NORMAL', o.text||'');
+  }catch(err){}
 };
 </script>
 </body></html>
@@ -134,7 +134,6 @@ es.onmessage=function(e){
         return o;
     }
 
-    // Empuja un evento SSE al cliente conectado (si hay).
     void pushSse(const String &sev, const String &text)
     {
         if (sseConnected && sseClient.connected())
@@ -160,9 +159,16 @@ es.onmessage=function(e){
             "Connection: keep-alive\r\n"
             "Access-Control-Allow-Origin: *\r\n"
             "\r\n");
-        // Al abrir/recargar, mandamos el ultimo mensaje conocido.
         if (lastText.length() > 0)
             pushSse(lastSev, lastText);
+    }
+
+    void handleHangup()
+    {
+        server.sendHeader("Access-Control-Allow-Origin", "*");
+        server.send(200, "text/plain", "OK");
+        if (hangupCb)
+            hangupCb();
     }
 }
 
@@ -172,6 +178,7 @@ namespace Screen
     {
         server.on("/", handleRoot);
         server.on("/events", handleEvents);
+        server.on("/hangup", handleHangup);
         server.begin();
         started = true;
         Serial.printf("[SCREEN] server web en http://%s/\n",
@@ -199,5 +206,21 @@ namespace Screen
         lastSev = severity.length() ? severity : "NORMAL";
         Serial.printf("[SCREEN] %s | %s\n", lastSev.c_str(), text.c_str());
         pushSse(lastSev, text);
+    }
+
+    void clear()
+    {
+        lastText = "";
+        lastSev = "NORMAL";
+        if (sseConnected && sseClient.connected())
+        {
+            sseClient.print("data: {\"clear\":true}\n\n");
+        }
+        Serial.println("[SCREEN] limpio mensajes");
+    }
+
+    void onHangup(void (*callback)())
+    {
+        hangupCb = callback;
     }
 }

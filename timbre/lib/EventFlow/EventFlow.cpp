@@ -5,113 +5,137 @@
 #include "Device.h"
 #include "CameraSource.h"
 #include "LowPower.h"
-#include "foto_prueba.h"
+// foto_prueba.h ya no se usa: el press manda la captura real de Camera
 
 #include <WiFi.h>
-#include <WebServer.h>
+#include <WiFiServer.h>
 
 #ifndef EVENTFLOW_CONNECT_TIMEOUT_MS
-#define EVENTFLOW_CONNECT_TIMEOUT_MS 10000 // 10s esperando la conexion al backend
+#define EVENTFLOW_CONNECT_TIMEOUT_MS 10000
 #endif
 
+// Buffer del task MJPEG: VGA JPEG cabe holgado en 100KB.
+#define MJPEG_BUF_SIZE (100 * 1024)
+
 // ---------------------------------------------------------------------------
-// EventFlow: coordinador UNICO del evento (fusion de la ex politica de backend
-// + el stream local que antes vivia en CallManager). Al tocar el timbre se
-// disparan DOS caminos EN PARALELO:
+// EventFlow: coordinador UNICO del evento.
 //
-//   onTimbre()
-//     |-- LOCAL  (dueño del ciclo de vida): sube energia, prende camara y
-//     |          levanta el server HTTP :8081 (/stream, /hangup). El colgado
-//     |          SIEMPRE es local: /hangup es la UNICA salida del evento ->
-//     |          cierra todo + LowPower::enterIdleMode().
-//     '-- BACKEND (invitado): conecta MQTT y manda el press. Si llega
-//                STOP_DANGER se cierra SOLO la sesion de backend (cerrarSesion);
-//                la camara, la energia y el stream local NO se tocan.
+// Dos caminos EN PARALELO al tocar el timbre:
+//   LOCAL  (dueño del ciclo de vida):
+//     - Sube energia, prende camara.
+//     - Levanta un task MJPEG en core 0 que sirve el stream en :8081.
+//     - /hangup vive en Screen (:80) y es la UNICA salida del evento.
+//   BACKEND (invitado):
+//     - Conecta MQTT y manda el press. Si llega STOP_DANGER se cierra SOLO
+//       la sesion de backend; camara, energia y stream local NO se tocan.
 //
-// La camara la maneja SIEMPRE la instancia global Camera (CameraSource): tanto
-// el stream local como (mas adelante) el RTSP le piden frames a ella.
+// El stream MJPEG corre en un FreeRTOS task en core 0 para no bloquear el
+// loop principal (core 1) que bombea MQTT, backend y Screen.
 // ---------------------------------------------------------------------------
 
 namespace
 {
-    enum class Backend
-    {
-        OFF,        // camino de backend inactivo (o ya cerrado por STOP_DANGER)
-        CONECTANDO, // foto lista, esperando que MQTT quede listo
-        EN_SESION   // press enviado, escuchando ia_response
-    };
+    enum class Backend { OFF, CONECTANDO, EN_SESION };
 
     MediaSource *src = nullptr;
 
-    bool eventoActivo = false;      // ciclo de vida del evento (lo posee LOCAL)
-    Backend backend = Backend::OFF; // sub-estado del camino de backend
+    bool eventoActivo = false;
+    Backend backend = Backend::OFF;
     unsigned long conectandoDesde = 0;
     String trackId = "";
 
-    WebServer *localServer = nullptr;   // stream local (ex CallManager, :8081)
-    volatile bool hangupPedido = false; // lo setea /hangup o terminar()
+    volatile bool hangupPedido = false;
 
-    // --- server local (stream de video para ver en la LAN) ----------------
-    void handleRoot()
+    // --- MJPEG task (core 0) ----------------------------------------------
+    TaskHandle_t mjpegTaskHandle = nullptr;
+    volatile bool mjpegStop = false;
+
+    void mjpegTask(void *param)
     {
-        localServer->sendHeader("Access-Control-Allow-Origin", "*");
-        localServer->send(200, "text/html",
-                          "<html><body><h2>Timbre</h2>"
-                          "<p>Stream: <a href='/stream'>/stream</a></p>"
-                          "<p><a href='/hangup'>Hangup</a></p></body></html>");
-    }
+        WiFiServer mjpegServer(8081);
+        mjpegServer.begin();
+        Serial.println("[MJPEG] server iniciado en :8081 (core 0)");
 
-    void handleHangup()
-    {
-        localServer->sendHeader("Access-Control-Allow-Origin", "*");
-        localServer->send(200, "text/plain", "OK");
-        hangupPedido = true; // el teardown real lo hace loop() -> endEvent()
-    }
-
-    void handleStream()
-    {
-        WiFiClient client = localServer->client();
-        if (!client)
-            return;
-
-        const uint8_t *frame = nullptr;
-        size_t frameLen = 0;
-        if (!Camera.nextVideoFrame(&frame, &frameLen))
+        // Buffer local: el task copia el frame aca antes de escribir al socket,
+        // asi no retiene el mutex de Camera durante el I/O (lento).
+        uint8_t *buf = (uint8_t *)ps_malloc(MJPEG_BUF_SIZE);
+        if (!buf)
         {
-            localServer->send(503, "text/plain", "No frame available");
+            Serial.println("[MJPEG] sin memoria para buffer");
+            mjpegServer.stop();
+            vTaskDelete(NULL);
             return;
         }
 
-        client.println("HTTP/1.1 200 OK");
-        client.println("Content-Type: image/jpeg");
-        client.println("Access-Control-Allow-Origin: *");
-        client.println("Cache-Control: no-cache, no-store, max-age=0");
-        client.println("Connection: close");
-        client.print("Content-Length: ");
-        client.println(String(frameLen));
-        client.println();
-        client.write(frame, frameLen);
-        client.stop();
-        // el buffer es propiedad de CameraSource; NO se libera aca.
+        while (!mjpegStop)
+        {
+            WiFiClient client = mjpegServer.available();
+            if (!client)
+            {
+                vTaskDelay(pdMS_TO_TICKS(50));
+                continue;
+            }
+
+            Serial.println("[MJPEG] cliente conectado");
+
+            // Mandar header multipart (MJPEG estandar)
+            client.println("HTTP/1.1 200 OK");
+            client.println("Content-Type: multipart/x-mixed-replace; boundary=frame");
+            client.println("Access-Control-Allow-Origin: *");
+            client.println("Cache-Control: no-cache");
+            client.println("Connection: close");
+            client.println();
+
+            while (client.connected() && !mjpegStop)
+            {
+                size_t len = 0;
+                if (Camera.captureFrameCopy(buf, MJPEG_BUF_SIZE, &len))
+                {
+                    client.printf("--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n", len);
+                    client.write(buf, len);
+                    client.print("\r\n");
+                }
+                vTaskDelay(pdMS_TO_TICKS(40)); // ~25 fps objetivo
+            }
+
+            client.stop();
+            Serial.println("[MJPEG] cliente desconectado");
+        }
+
+        free(buf);
+        mjpegServer.stop();
+        Serial.println("[MJPEG] task terminado");
+        mjpegTaskHandle = nullptr;
+        vTaskDelete(NULL);
     }
 
-    void startLocalServer()
+    void startMjpegTask()
     {
-        localServer = new WebServer(8081);
-        localServer->on("/", handleRoot);
-        localServer->on("/hangup", handleHangup);
-        localServer->on("/stream", handleStream);
-        localServer->begin();
-        Serial.println("[FLOW] stream local iniciado en :8081");
+        mjpegStop = false;
+        xTaskCreatePinnedToCore(
+            mjpegTask,       // funcion
+            "mjpeg",         // nombre
+            8192,            // stack (bytes)
+            NULL,            // param
+            1,               // prioridad (baja, no critico)
+            &mjpegTaskHandle,
+            0                // core 0 (el loop de Arduino corre en core 1)
+        );
     }
 
-    void stopLocalServer()
+    void stopMjpegTask()
     {
-        if (!localServer)
+        if (!mjpegTaskHandle)
             return;
-        localServer->stop();
-        delete localServer;
-        localServer = nullptr;
+        mjpegStop = true;
+        // Esperamos a que el task termine limpiamente (max 2s).
+        for (int i = 0; i < 40 && mjpegTaskHandle != nullptr; i++)
+            delay(50);
+        if (mjpegTaskHandle)
+        {
+            vTaskDelete(mjpegTaskHandle);
+            mjpegTaskHandle = nullptr;
+        }
     }
 
     void raisePower()
@@ -120,20 +144,19 @@ namespace
         WiFi.setSleep(false);
     }
 
-    // Fin del evento. SOLO se llega aca por /hangup local (o terminar()).
     void endEvent()
     {
         Serial.println("[FLOW] hangup local -> cierro el evento");
 
-        // Si el backend seguia vivo, lo cerramos limpio.
         if (backend != Backend::OFF || DoorbellSession::haySesionActiva())
             DoorbellSession::cerrarSesion(trackId);
         backend = Backend::OFF;
 
-        stopLocalServer();
+        stopMjpegTask();
+        Screen::clear();
         eventoActivo = false;
 
-        LowPower::enterIdleMode(); // camara off + 80MHz + WiFi sleep
+        LowPower::enterIdleMode();
     }
 
     void mostrarEnScreen(const MqttClient::IaResponse &r)
@@ -144,22 +167,19 @@ namespace
         Screen::showMessage(text, r.severity);
     }
 
-    // Cada ia_response de la sesion de backend activa (via DoorbellSession).
     void onRespuesta(const MqttClient::IaResponse &r)
     {
-        mostrarEnScreen(r); // reflejar siempre en la pantalla (SSE)
+        mostrarEnScreen(r);
 
         if (r.isStopDanger())
         {
             Serial.println("[FLOW] STOP_DANGER -> cierro SOLO el backend (el stream local sigue)");
-            // TODO: alerta local (buzzer / luz)
             DoorbellSession::cerrarSesion(trackId);
-            backend = Backend::OFF; // muere el backend; el evento local continua
+            backend = Backend::OFF;
         }
         else
         {
             Serial.println("[FLOW] CONTINUE -> (placeholder) aca sigue el flujo de media");
-            // >>> PLACEHOLDER: audio/video por RTSP <<<
         }
     }
 }
@@ -171,8 +191,12 @@ namespace EventFlow
         src = source;
         if (src)
             src->begin();
-        DoorbellSession::begin(deviceId); // configura el transporte (no conecta)
+        DoorbellSession::begin(deviceId);
         DoorbellSession::onRespuesta(onRespuesta);
+
+        // /hangup vive en Screen (:80) y dispara terminar().
+        Screen::onHangup(EventFlow::terminar);
+
         eventoActivo = false;
         backend = Backend::OFF;
         Serial.println("[FLOW] EventFlow listo (IDLE)");
@@ -190,14 +214,12 @@ namespace EventFlow
         trackId = Device::generateUUID();
         Serial.printf("[FLOW] trackId del evento: %s\n", trackId.c_str());
 
-        // --- LOCAL: dueño del evento. Sube energia, prende camara, server. ---
         raisePower();
         Camera.begin();
-        startLocalServer();
+        startMjpegTask();
         hangupPedido = false;
         eventoActivo = true;
 
-        // --- BACKEND (invitado): dispara la conexion MQTT (no bloquea). ---
         DoorbellSession::conectar();
         conectandoDesde = millis();
         backend = Backend::CONECTANDO;
@@ -205,19 +227,14 @@ namespace EventFlow
 
     void terminar()
     {
-        // Equivale a un hangup local (para el disparo por serial 'e').
         if (eventoActivo)
             hangupPedido = true;
     }
 
     void loop()
     {
-        DoorbellSession::loop(); // bombea MQTT (conexion + entrantes)
+        DoorbellSession::loop();
 
-        if (localServer)
-            localServer->handleClient(); // atiende /stream y /hangup
-
-        // Avanzar el camino de backend (solo mientras este vivo).
         if (backend == Backend::CONECTANDO)
         {
             if (DoorbellSession::estaListo())
@@ -240,7 +257,6 @@ namespace EventFlow
             }
         }
 
-        // Salida del evento: SIEMPRE por hangup local.
         if (hangupPedido)
         {
             hangupPedido = false;
