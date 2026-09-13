@@ -56,14 +56,15 @@ bool CameraSource::begin()
 
     if (psramFound())
     {
-        config.frame_size = FRAMESIZE_QVGA;
-        config.jpeg_quality = 12;
-        config.fb_count = 2; // stream local + RTSP piden frames
+        config.frame_size = FRAMESIZE_VGA; // 640x480 (antes QVGA 320x240)
+        config.jpeg_quality = 12;          // 10-63: menor = mejor (mas pesado)
+        config.fb_count = 2;               // stream local + RTSP piden frames
         config.fb_location = CAMERA_FB_IN_PSRAM;
         config.grab_mode = CAMERA_GRAB_LATEST;
     }
     else
     {
+        // Sin PSRAM no conviene VGA; caemos a QVGA para no quedarnos sin RAM.
         config.frame_size = FRAMESIZE_QVGA;
         config.jpeg_quality = 12;
         config.fb_count = 2;
@@ -77,10 +78,34 @@ bool CameraSource::begin()
         return false;
     }
 
-    // Ajustes del sensor (orientacion, etc.). Si la imagen sale de cabeza,
-    // descomentar el vflip / hmirror:
-    // sensor_t *s = esp_camera_sensor_get();
-    // if (s) { s->set_vflip(s, 1); s->set_hmirror(s, 1); }
+    // Ajustes del sensor (OV2640). Valores de arranque orientados a poca luz;
+    // ajustar EN VIVO mirando el stream (lo ideal cambia con la escena/luz).
+    sensor_t *s = esp_camera_sensor_get();
+    if (s)
+    {
+        // --- Orientacion (corrige el "de cabeza"): probar 0/1 en cada uno ---
+        s->set_vflip(s, 1);
+        s->set_hmirror(s, 0);
+
+        // --- Luz / exposicion (tu escena sale oscura) ---
+        s->set_brightness(s, 1);                 // -2..2  (+1 aclara)
+        s->set_ae_level(s, 1);                   // -2..2  exposicion
+        s->set_aec2(s, 1);                       // control de exposicion mejorado
+        s->set_gainceiling(s, GAINCEILING_16X);  // mas ganancia en penumbra
+        s->set_denoise(s, 1);                    // baja el ruido de la ganancia
+
+        // --- Color / balance de blancos (sale verdoso) ---
+        s->set_whitebal(s, 1);
+        s->set_awb_gain(s, 1);
+        s->set_saturation(s, 0);                 // -2..2
+
+        // --- Nitidez / correcciones ---
+        s->set_contrast(s, 1);                   // -2..2
+        s->set_sharpness(s, 1);                  // -2..2
+        s->set_lenc(s, 1);                       // correccion de lente (bordes)
+        s->set_bpc(s, 1);                        // correccion pixeles negros
+        s->set_wpc(s, 1);                        // correccion pixeles blancos
+    }
 
     _ready = true;
     Serial.println("[CAM] lista");

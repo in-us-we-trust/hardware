@@ -43,12 +43,12 @@ namespace
 
     MediaSource *src = nullptr;
 
-    bool eventoActivo = false;         // ciclo de vida del evento (lo posee LOCAL)
-    Backend backend = Backend::OFF;    // sub-estado del camino de backend
+    bool eventoActivo = false;      // ciclo de vida del evento (lo posee LOCAL)
+    Backend backend = Backend::OFF; // sub-estado del camino de backend
     unsigned long conectandoDesde = 0;
     String trackId = "";
 
-    WebServer *localServer = nullptr;  // stream local (ex CallManager, :8081)
+    WebServer *localServer = nullptr;   // stream local (ex CallManager, :8081)
     volatile bool hangupPedido = false; // lo setea /hangup o terminar()
 
     // --- server local (stream de video para ver en la LAN) ----------------
@@ -222,7 +222,7 @@ namespace EventFlow
         {
             if (DoorbellSession::estaListo())
             {
-                if (!DoorbellSession::enviarFotoBase64(trackId, FOTO_PRUEBA_B64))
+                if (!DoorbellSession::enviarFotoBase64(trackId, Camera.captureBase64()))
                 {
                     Serial.println("[FLOW] fallo el press: cierro backend (el evento local sigue)");
                     backend = Backend::OFF;
