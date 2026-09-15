@@ -4,8 +4,9 @@
 #include "Screen.h"
 #include "Device.h"
 #include "CameraSource.h"
+#include "AudioSource.h"
 #include "LowPower.h"
-// foto_prueba.h ya no se usa: el press manda la captura real de Camera
+#include "RtspPublisher.h"
 
 #include <WiFi.h>
 #include <WiFiServer.h>
@@ -14,28 +15,24 @@
 #define EVENTFLOW_CONNECT_TIMEOUT_MS 10000
 #endif
 
-// Buffer del task MJPEG: VGA JPEG cabe holgado en 100KB.
 #define MJPEG_BUF_SIZE (100 * 1024)
 
 // ---------------------------------------------------------------------------
 // EventFlow: coordinador UNICO del evento.
 //
 // Dos caminos EN PARALELO al tocar el timbre:
-//   LOCAL  (dueño del ciclo de vida):
-//     - Sube energia, prende camara.
-//     - Levanta un task MJPEG en core 0 que sirve el stream en :8081.
-//     - /hangup vive en Screen (:80) y es la UNICA salida del evento.
-//   BACKEND (invitado):
-//     - Conecta MQTT y manda el press. Si llega STOP_DANGER se cierra SOLO
-//       la sesion de backend; camara, energia y stream local NO se tocan.
-//
-// El stream MJPEG corre en un FreeRTOS task en core 0 para no bloquear el
-// loop principal (core 1) que bombea MQTT, backend y Screen.
+//   LOCAL:   MJPEG task en core 0 (:8081), Screen en core 1 (:80)
+//   BACKEND: MQTT press + RTSP video+audio hacia MediaMTX
 // ---------------------------------------------------------------------------
 
 namespace
 {
-    enum class Backend { OFF, CONECTANDO, EN_SESION };
+    enum class Backend
+    {
+        OFF,
+        CONECTANDO,
+        EN_SESION
+    };
 
     MediaSource *src = nullptr;
 
@@ -56,8 +53,6 @@ namespace
         mjpegServer.begin();
         Serial.println("[MJPEG] server iniciado en :8081 (core 0)");
 
-        // Buffer local: el task copia el frame aca antes de escribir al socket,
-        // asi no retiene el mutex de Camera durante el I/O (lento).
         uint8_t *buf = (uint8_t *)ps_malloc(MJPEG_BUF_SIZE);
         if (!buf)
         {
@@ -78,7 +73,6 @@ namespace
 
             Serial.println("[MJPEG] cliente conectado");
 
-            // Mandar header multipart (MJPEG estandar)
             client.println("HTTP/1.1 200 OK");
             client.println("Content-Type: multipart/x-mixed-replace; boundary=frame");
             client.println("Access-Control-Allow-Origin: *");
@@ -95,7 +89,7 @@ namespace
                     client.write(buf, len);
                     client.print("\r\n");
                 }
-                vTaskDelay(pdMS_TO_TICKS(40)); // ~25 fps objetivo
+                vTaskDelay(pdMS_TO_TICKS(40));
             }
 
             client.stop();
@@ -112,15 +106,8 @@ namespace
     void startMjpegTask()
     {
         mjpegStop = false;
-        xTaskCreatePinnedToCore(
-            mjpegTask,       // funcion
-            "mjpeg",         // nombre
-            8192,            // stack (bytes)
-            NULL,            // param
-            1,               // prioridad (baja, no critico)
-            &mjpegTaskHandle,
-            0                // core 0 (el loop de Arduino corre en core 1)
-        );
+        xTaskCreatePinnedToCore(mjpegTask, "mjpeg", 8192, NULL, 1,
+                                &mjpegTaskHandle, 0);
     }
 
     void stopMjpegTask()
@@ -128,7 +115,6 @@ namespace
         if (!mjpegTaskHandle)
             return;
         mjpegStop = true;
-        // Esperamos a que el task termine limpiamente (max 2s).
         for (int i = 0; i < 40 && mjpegTaskHandle != nullptr; i++)
             delay(50);
         if (mjpegTaskHandle)
@@ -150,13 +136,19 @@ namespace
 
         if (backend != Backend::OFF || DoorbellSession::haySesionActiva())
             DoorbellSession::cerrarSesion(trackId);
+
+        // Parar RTSP antes de apagar camara/mic
+        if (RtspPublisher::isPublishing() || RtspPublisher::state() != RtspPublisher::State::Idle)
+            RtspPublisher::stop();
+
         backend = Backend::OFF;
 
         stopMjpegTask();
+        Microphone.end();
         Screen::clear();
         eventoActivo = false;
 
-        LowPower::enterIdleMode();
+        LowPower::enterIdleMode(); // camara off + 80MHz + WiFi sleep
     }
 
     void mostrarEnScreen(const MqttClient::IaResponse &r)
@@ -174,12 +166,14 @@ namespace
         if (r.isStopDanger())
         {
             Serial.println("[FLOW] STOP_DANGER -> cierro SOLO el backend (el stream local sigue)");
+            if (RtspPublisher::isPublishing())
+                RtspPublisher::stop();
             DoorbellSession::cerrarSesion(trackId);
             backend = Backend::OFF;
         }
         else
         {
-            Serial.println("[FLOW] CONTINUE -> (placeholder) aca sigue el flujo de media");
+            Serial.println("[FLOW] CONTINUE -> backend sigue");
         }
     }
 }
@@ -193,9 +187,14 @@ namespace EventFlow
             src->begin();
         DoorbellSession::begin(deviceId);
         DoorbellSession::onRespuesta(onRespuesta);
-
-        // /hangup vive en Screen (:80) y dispara terminar().
         Screen::onHangup(EventFlow::terminar);
+
+        // Configurar RTSP publisher con Camera + Microphone
+        RtspPublisher::begin(
+            String(MEDIAMTX_HOST), // del platformio.ini
+            &Camera,               // video: dueño unico de la camara
+            &Microphone,           // audio: dueño unico del microfono
+            "doorbell");
 
         eventoActivo = false;
         backend = Backend::OFF;
@@ -216,6 +215,7 @@ namespace EventFlow
 
         raisePower();
         Camera.begin();
+        Microphone.begin();
         startMjpegTask();
         hangupPedido = false;
         eventoActivo = true;
@@ -235,6 +235,25 @@ namespace EventFlow
     {
         DoorbellSession::loop();
 
+        // Bombear audio (lee del DMA, acumula, codifica chunks)
+        if (eventoActivo)
+        {
+            Microphone.loop();
+
+            // Empujar el nivel a la pantalla para la animacion (throttle ~120ms,
+            // no cada chunk de 20ms, para no saturar el SSE ni la red).
+            static unsigned long lastLevelMs = 0;
+            if (millis() - lastLevelMs >= 120)
+            {
+                lastLevelMs = millis();
+                Screen::pushLevel(Microphone.level());
+            }
+        }
+
+        // Bombear RTSP (manda video + audio por RTP)
+        if (backend == Backend::EN_SESION)
+            RtspPublisher::loop();
+
         if (backend == Backend::CONECTANDO)
         {
             if (DoorbellSession::estaListo())
@@ -248,6 +267,10 @@ namespace EventFlow
                 {
                     Serial.printf("[FLOW] sesion de backend iniciada trackId=%s\n", trackId.c_str());
                     backend = Backend::EN_SESION;
+
+                    // Arrancar RTSP (video + audio hacia MediaMTX)
+                    if (!RtspPublisher::start())
+                        Serial.println("[FLOW] RTSP no arranco (el evento local sigue)");
                 }
             }
             else if (millis() - conectandoDesde > EVENTFLOW_CONNECT_TIMEOUT_MS)
