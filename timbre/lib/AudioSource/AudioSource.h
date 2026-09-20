@@ -8,6 +8,11 @@
 // Entrega chunks de 160 bytes (20ms de audio a 8kHz) listos para empaquetar
 // como RTP payload type 0 (PCMU).
 //
+// MODO TEST: si se define AUDIO_TEST_MODE (platformio.ini), en vez de leer el
+// microfono, entrega en loop el audio embebido de audio_prueba.h. Sirve para
+// confirmar que TODO el camino (RTSP -> gateway -> Detective Manager -> ML)
+// funciona con audio limpio conocido, aislando si el problema es el microfono.
+//
 // No es thread-safe (solo se accede desde core 1, el loop principal).
 // ---------------------------------------------------------------------------
 
@@ -23,6 +28,7 @@ public:
     void end();
 
     // Leer del buffer DMA y acumular. Llamar en cada vuelta del loop().
+    // En AUDIO_TEST_MODE no hace nada (nextAudioChunk sirve directo del array).
     void loop();
 
     // Devuelve el ultimo chunk de audio codificado (G.711 u-law, 160 bytes).
@@ -50,6 +56,11 @@ private:
     uint16_t _level = 0; // amplitud RMS del ultimo chunk
 
     void encodeChunk(); // downsample + u-law encode
+
+#ifdef AUDIO_TEST_MODE
+    size_t _testPos = 0;       // posicion actual dentro del array embebido
+    unsigned long _lastChunkMs = 0; // para entregar un chunk cada 20ms
+#endif
 };
 
 extern AudioSource Microphone;

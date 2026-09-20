@@ -28,8 +28,8 @@
 // ni portal. La red debe ser 2.4GHz. Cuando el timbre ya conecte, poné
 // SEED_WIFI_MANUAL en 0 y reflashea; las credenciales quedan guardadas en NVS.
 #define SEED_WIFI_MANUAL 1
-#define SEED_WIFI_SSID "mi-wifi"
-#define SEED_WIFI_PASS "mi-psw"
+#define SEED_WIFI_SSID "Personal-817"
+#define SEED_WIFI_PASS "RvTW7gzW9B"
 
 size_t getArduinoLoopTaskStackSize(void) { return 16 * 1024; }
 
