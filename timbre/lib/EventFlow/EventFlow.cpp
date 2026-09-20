@@ -7,6 +7,7 @@
 #include "AudioSource.h"
 #include "LowPower.h"
 #include "RtspPublisher.h"
+#include "JpegDetector.h"
 
 #include <WiFi.h>
 #include <WiFiServer.h>
