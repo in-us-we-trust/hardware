@@ -8,7 +8,7 @@
 
 // ---------------------------------------------------------------------------
 // Config por build flags (con defaults). Se pueden pisar desde platformio.ini
-// igual que WOKWI_SEED_*, sin tocar este archivo.
+// igual que SEED_WIFI_*, sin tocar este archivo.
 // ---------------------------------------------------------------------------
 #ifndef MQTT_BUFFER_SIZE
 // press/stream_end/capture son JSON chicos (<1KB). Si algun dia se manda la
@@ -55,7 +55,7 @@ namespace
 
     MqttClient::IaResponseHandler iaHandler = nullptr;
 
-    bool started = false;    // configurado (begin llamado)
+    bool started = false;    // configurado (initialize llamado)
     bool enabled = false;    // debe estar conectado (conectar llamado)
     bool subscribed = false; // suscripto a ia_response
     unsigned long lastConnectAttempt = 0;
@@ -177,7 +177,7 @@ namespace
 
 namespace MqttClient
 {
-    void begin(const String &host, uint16_t port, const String &id)
+    void initialize(const String &host, uint16_t port, const String &id)
     {
         brokerHost = host;
         brokerPort = port;

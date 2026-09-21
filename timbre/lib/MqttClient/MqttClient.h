@@ -111,7 +111,7 @@ namespace MqttClient
     // la conexion se maneja de forma perezosa en loop().
     //   host: IP/hostname del broker alcanzable por el ESP32 y el gateway.
     //   port: 1883 tipico.
-    void begin(const String &host, uint16_t port, const String &deviceId);
+    void initialize(const String &host, uint16_t port, const String &deviceId);
 
     // Registra el handler de ia_response. Opcional.
     void onIaResponse(IaResponseHandler handler);
@@ -124,7 +124,7 @@ namespace MqttClient
     bool connected();
 
     // Dispara la conexion al broker (no bloquea). El resultado se resuelve en
-    // loop(). Antes de esto, begin() solo configura pero no conecta.
+    // loop(). Antes de esto, initialize() solo configura pero no conecta.
     void conectar();
 
     // Deja de reintentar y cierra la conexion si estaba abierta. Se vuelve a

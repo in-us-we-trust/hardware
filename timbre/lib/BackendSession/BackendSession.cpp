@@ -1,25 +1,10 @@
-#include "DoorbellSession.h"
+#include "BackendSession.h"
 
 #include "Device.h"
 #include "MqttClient.h"
+#include "RtspPublisher.h"
+#include "Config.h"
 #include "mbedtls/base64.h"
-
-// --- Config (desde platformio.ini via build_flags, con defaults) -----------
-#ifndef MQTT_BROKER_HOST
-#define MQTT_BROKER_HOST "test.mosquitto.org"
-#endif
-#ifndef MQTT_BROKER_PORT
-#define MQTT_BROKER_PORT 1883
-#endif
-#ifndef MEDIAMTX_HOST
-#define MEDIAMTX_HOST "192.168.1.50"
-#endif
-#ifndef MEDIAMTX_PORT
-#define MEDIAMTX_PORT 8554
-#endif
-#ifndef MEDIAMTX_PATH
-#define MEDIAMTX_PATH "doorbell"
-#endif
 
 namespace
 {
@@ -27,12 +12,12 @@ namespace
     String trackId; // == eventId del press; "" cuando no hay sesion
     bool active = false;
 
-    DoorbellSession::RespuestaHandler respuestaHandler = nullptr;
+    BackendSession::RespuestaHandler respuestaHandler = nullptr;
 
     String rtspUrl()
     {
-        return String("rtsp://") + MEDIAMTX_HOST + ":" + String(MEDIAMTX_PORT) +
-               "/" + MEDIAMTX_PATH;
+        return String("rtsp://") + Config::Media::HOST + ":" + String(Config::Media::PORT) +
+               "/" + Config::Media::PATH;
     }
 
     // Codifica bytes crudos a base64 (para el campo image del press, MQTT).
@@ -40,9 +25,11 @@ namespace
     {
         size_t need = 0;
         mbedtls_base64_encode(nullptr, 0, &need, data, len); // pide tamaño
-        if (need == 0) return "";
+        if (need == 0)
+            return "";
         uint8_t *out = (uint8_t *)malloc(need);
-        if (!out) return "";
+        if (!out)
+            return "";
         size_t written = 0;
         String result;
         if (mbedtls_base64_encode(out, need, &written, data, len) == 0)
@@ -70,16 +57,21 @@ namespace
     }
 }
 
-namespace DoorbellSession
+namespace BackendSession
 {
-    void begin(const String &id)
+    void initialize(const String &id, MediaSource *video, AudioSource *audio)
     {
         deviceId = id;
         active = false;
         trackId = "";
-        MqttClient::begin(MQTT_BROKER_HOST, MQTT_BROKER_PORT, deviceId);
+        MqttClient::initialize(Config::Mqtt::BROKER_HOST, Config::Mqtt::BROKER_PORT, deviceId);
+        // CALLBACK
         MqttClient::onIaResponse(handleIaResponse);
-        Serial.println("[SESSION] configurada (MQTT sin conectar aun)");
+
+        // El stream RTSP (video + audio) tambien es transporte hacia el backend.
+        RtspPublisher::initialize(Config::Media::HOST, video, audio, Config::Media::PATH);
+
+        Serial.println("[SESSION] configurada (MQTT + RTSP sin conectar aun)");
     }
 
     void onRespuesta(RespuestaHandler handler)
@@ -123,28 +115,38 @@ namespace DoorbellSession
 
         active = true;
         Serial.printf("[SESSION] press enviado (foto base64 %u chars) trackId=%s\n",
-                      (unsigned)fotoBase64.length(), trackId.c_str());
+                    (unsigned)fotoBase64.length(), trackId.c_str());
         return true;
     }
 
-    void enviarVideo()
+    bool iniciarMedia()
     {
-        // >>> FASE SIGUIENTE <<<
-        // Aca ira el arranque del track de video en el stream RTSP, de donde el
-        // gateway extrae los VideoChunk.
-        Serial.println("[SESSION] enviarVideo() TODO (RTSP fase siguiente)");
+        // Negocia todos los tracks disponibles; el envio arranca apagado.
+        bool ok = RtspPublisher::start();
+        if (!ok)
+            Serial.println("[SESSION] RTSP no arranco (el evento local sigue)");
+        return ok;
     }
 
-    void enviarAudio()
+    void activarVideo(bool activo)
     {
-        // >>> FASE SIGUIENTE <<<
-        // Idem para el track de audio (AudioChunk del gateway).
-        Serial.println("[SESSION] enviarAudio() TODO (RTSP fase siguiente)");
+        RtspPublisher::setVideoActivo(activo);
+    }
+
+    void activarAudio(bool activo)
+    {
+        RtspPublisher::setAudioActivo(activo);
     }
 
     void cerrarSesion(const String &id)
     {
-        if (!active) return;
+        // Frenar el RTSP siempre (aunque la sesion MQTT ya no este activa), para
+        // no dejar el stream publicando.
+        if (RtspPublisher::isPublishing() || RtspPublisher::state() != RtspPublisher::State::Idle)
+            RtspPublisher::stop();
+
+        if (!active)
+            return;
         MqttClient::publishStreamEnd(id);
         Serial.printf("[SESSION] sesion cerrada (stream_end) trackId=%s\n",
                       id.c_str());
@@ -155,6 +157,10 @@ namespace DoorbellSession
     void loop()
     {
         MqttClient::loop();
+
+        // Mientras el stream publica, hay que bombearlo (manda video+audio RTP).
+        if (RtspPublisher::isPublishing())
+            RtspPublisher::loop();
     }
 
     bool haySesionActiva() { return active; }

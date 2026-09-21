@@ -1,11 +1,8 @@
 #include "RtspPublisher.h"
+#include "Config.h"
 #include <WiFi.h>
 #include <WiFiClient.h>
 #include <string.h>
-
-#ifndef MEDIAMTX_PORT
-#define MEDIAMTX_PORT 8554
-#endif
 
 #define RTP_PT_JPEG 26 // video JPEG (RFC 2435)
 #define RTP_PT_PCMU 0  // audio G.711 u-law
@@ -22,7 +19,13 @@ namespace
     WiFiClient tcp;
     MediaSource *videoSrc = nullptr;
     AudioSource *audioSrc = nullptr;
+    // "has*" = track NEGOCIADO (declarado en el SDP; su fuente existe). Fijo
+    // durante la sesion. "*Activo" = si ese track esta ENVIANDO RTP ahora
+    // mismo; se prende/apaga en vivo con setVideoActivo()/setAudioActivo().
+    bool hasVideo = false;
     bool hasAudio = false;
+    bool videoActivo = false;
+    bool audioActivo = false;
 
     String mtxHost;
     String mtxPath = "doorbell";
@@ -47,7 +50,7 @@ namespace
 
     String rtspUrl()
     {
-        return "rtsp://" + mtxHost + ":" + String(MEDIAMTX_PORT) + "/" + mtxPath;
+        return "rtsp://" + mtxHost + ":" + String(Config::Media::PORT) + "/" + mtxPath;
     }
 
     // --- RTSP helpers -----------------------------------------------------
@@ -111,11 +114,14 @@ namespace
         sdp += "s=timbre\r\n";
         sdp += "c=IN IP4 0.0.0.0\r\n";
         sdp += "t=0 0\r\n";
-        // Track 0: video JPEG
-        sdp += "m=video 0 RTP/AVP 26\r\n";
-        sdp += "a=rtpmap:26 JPEG/90000\r\n";
-        sdp += "a=control:streamid=0\r\n";
-        // Track 1: audio G.711 u-law (solo si hay AudioSource)
+        // Track 0: video JPEG (solo si el video esta activo en este evento)
+        if (hasVideo)
+        {
+            sdp += "m=video 0 RTP/AVP 26\r\n";
+            sdp += "a=rtpmap:26 JPEG/90000\r\n";
+            sdp += "a=control:streamid=0\r\n";
+        }
+        // Track 1: audio G.711 u-law (solo si el audio esta activo)
         if (hasAudio)
         {
             sdp += "m=audio 0 RTP/AVP 0\r\n";
@@ -123,6 +129,34 @@ namespace
             sdp += "a=control:streamid=1\r\n";
         }
         return sdp;
+    }
+
+    // SETUP de cada track. Incluyen Session solo si ya lo tenemos (el primer
+    // SETUP de la sesion todavia no lo tiene; el segundo si).
+    void sendSetupVideo()
+    {
+        String url = rtspUrl() + "/streamid=0";
+        String setup = "SETUP " + url + " RTSP/1.0\r\n";
+        setup += "CSeq: " + String(cseq++) + "\r\n";
+        if (sessionId.length() > 0)
+            setup += "Session: " + sessionId + "\r\n";
+        setup += "Transport: RTP/AVP/TCP;unicast;interleaved=0-1;mode=record\r\n";
+        setup += "\r\n";
+        tcp.print(setup);
+        Serial.println("[RTSP] -> SETUP video (interleaved 0-1)");
+    }
+
+    void sendSetupAudio()
+    {
+        String url = rtspUrl() + "/streamid=1";
+        String setup = "SETUP " + url + " RTSP/1.0\r\n";
+        setup += "CSeq: " + String(cseq++) + "\r\n";
+        if (sessionId.length() > 0)
+            setup += "Session: " + sessionId + "\r\n";
+        setup += "Transport: RTP/AVP/TCP;unicast;interleaved=2-3;mode=record\r\n";
+        setup += "\r\n";
+        tcp.print(setup);
+        Serial.println("[RTSP] -> SETUP audio (interleaved 2-3)");
     }
 
     void fail(const char *why)
@@ -354,31 +388,42 @@ namespace
 
 namespace RtspPublisher
 {
-    void begin(const String &mediaMtxHost, MediaSource *source,
+    void initialize(const String &mediaMtxHost, MediaSource *source,
                AudioSource *audio, const String &path)
     {
         mtxHost = mediaMtxHost;
         mtxPath = path;
         videoSrc = source;
         audioSrc = audio;
-        hasAudio = (audio != nullptr);
+        // hasVideo/hasAudio se deciden por evento en start(); aca solo guardamos
+        // que fuentes estan disponibles.
         st = State::Idle;
         vSsrc = esp_random();
         aSsrc = esp_random();
-        Serial.printf("[RTSP] configurado -> %s (audio: %s)\n",
-                      rtspUrl().c_str(), hasAudio ? "si" : "no");
+        Serial.printf("[RTSP] configurado -> %s (fuentes: video %s, audio %s)\n",
+                      rtspUrl().c_str(),
+                      videoSrc ? "si" : "no", audioSrc ? "si" : "no");
     }
 
     bool start()
     {
-        if (videoSrc == nullptr)
+        // Negociamos todos los tracks con fuente disponible; el envio arranca
+        // apagado y lo prende EventFlow cuando decide (deteccion).
+        hasVideo = (videoSrc != nullptr);
+        hasAudio = (audioSrc != nullptr);
+        videoActivo = false;
+        audioActivo = false;
+
+        if (!hasVideo && !hasAudio)
         {
-            fail("sin MediaSource");
+            fail("sin fuentes para publicar (ni video ni audio)");
             return false;
         }
 
-        Serial.printf("[RTSP] conectando a %s:%d...\n", mtxHost.c_str(), MEDIAMTX_PORT);
-        if (!tcp.connect(mtxHost.c_str(), MEDIAMTX_PORT))
+        Serial.printf("[RTSP] conectando a %s:%d... (negociando video %s, audio %s)\n",
+                      mtxHost.c_str(), Config::Media::PORT,
+                      hasVideo ? "si" : "no", hasAudio ? "si" : "no");
+        if (!tcp.connect(mtxHost.c_str(), Config::Media::PORT))
         {
             fail("no se pudo abrir TCP a MediaMTX");
             return false;
@@ -407,6 +452,36 @@ namespace RtspPublisher
     String streamUrl() { return rtspUrl(); }
     State state() { return st; }
 
+    void setVideoActivo(bool activo)
+    {
+        if (!hasVideo)
+        {
+            if (activo)
+                Serial.println("[RTSP] no se puede activar video: track no negociado");
+            return;
+        }
+        if (videoActivo != activo)
+        {
+            videoActivo = activo;
+            Serial.printf("[RTSP] video %s\n", activo ? "ON" : "OFF");
+        }
+    }
+
+    void setAudioActivo(bool activo)
+    {
+        if (!hasAudio)
+        {
+            if (activo)
+                Serial.println("[RTSP] no se puede activar audio: track no negociado");
+            return;
+        }
+        if (audioActivo != activo)
+        {
+            audioActivo = activo;
+            Serial.printf("[RTSP] audio %s\n", activo ? "ON" : "OFF");
+        }
+    }
+
     void loop()
     {
         switch (st)
@@ -422,15 +497,17 @@ namespace RtspPublisher
                 return;
             }
 
-            // SETUP track 0 (video) — interleaved canales 0-1
-            st = State::SettingUpVideo;
-            String url = rtspUrl() + "/streamid=0";
-            String setup = "SETUP " + url + " RTSP/1.0\r\n";
-            setup += "CSeq: " + String(cseq++) + "\r\n";
-            setup += "Transport: RTP/AVP/TCP;unicast;interleaved=0-1;mode=record\r\n";
-            setup += "\r\n";
-            tcp.print(setup);
-            Serial.println("[RTSP] -> SETUP video (interleaved 0-1)");
+            // SETUP del primer track activo: video si esta, si no audio.
+            if (hasVideo)
+            {
+                st = State::SettingUpVideo;
+                sendSetupVideo();
+            }
+            else
+            {
+                st = State::SettingUpAudio;
+                sendSetupAudio();
+            }
             break;
         }
         case State::SettingUpVideo:
@@ -450,21 +527,12 @@ namespace RtspPublisher
 
             if (hasAudio)
             {
-                // SETUP track 1 (audio) — interleaved canales 2-3
                 st = State::SettingUpAudio;
-                String url = rtspUrl() + "/streamid=1";
-                String setup = "SETUP " + url + " RTSP/1.0\r\n";
-                setup += "CSeq: " + String(cseq++) + "\r\n";
-                if (sessionId.length() > 0)
-                    setup += "Session: " + sessionId + "\r\n";
-                setup += "Transport: RTP/AVP/TCP;unicast;interleaved=2-3;mode=record\r\n";
-                setup += "\r\n";
-                tcp.print(setup);
-                Serial.println("[RTSP] -> SETUP audio (interleaved 2-3)");
+                sendSetupAudio();
             }
             else
             {
-                // Sin audio: directo a RECORD
+                // Solo video: directo a RECORD
                 st = State::Recording;
                 sendRequest("RECORD", "Range: npt=0.000-\r\n");
             }
@@ -480,6 +548,12 @@ namespace RtspPublisher
                 fail("SETUP audio no-200");
                 return;
             }
+
+            // Si el audio fue el PRIMER SETUP (modo solo-audio), el Session sale
+            // de aca. Si vino despues del video, ya lo teniamos (idempotente).
+            String sid = extractSession(resp);
+            if (sid.length() > 0)
+                sessionId = sid;
 
             st = State::Recording;
             sendRequest("RECORD", "Range: npt=0.000-\r\n");
@@ -497,8 +571,11 @@ namespace RtspPublisher
             }
             st = State::Publishing;
             lastFrameMs = 0;
-            Serial.println("[RTSP] PUBLICANDO (video" +
-                           String(hasAudio ? " + audio" : "") + ")");
+            Serial.println("[RTSP] LISTO para publicar (negociado: " +
+                           String(hasVideo ? "video" : "") +
+                           String(hasVideo && hasAudio ? " + " : "") +
+                           String(hasAudio ? "audio" : "") +
+                           "). Envio arranca apagado; lo activa EventFlow.");
             break;
         }
         case State::Publishing:
@@ -509,22 +586,25 @@ namespace RtspPublisher
                 return;
             }
 
-#ifndef RTSP_AUDIO_ONLY
-            // Video: a la cadencia del source
-            int fps = videoSrc->videoFps() > 0 ? videoSrc->videoFps() : 10;
-            unsigned long interval = 1000 / fps;
-            if (millis() - lastFrameMs >= interval)
+            // Video: a la cadencia del source. Solo si el track fue negociado
+            // Y esta activado en vivo (EventFlow decide).
+            if (hasVideo && videoActivo)
             {
-                lastFrameMs = millis();
-                const uint8_t *data;
-                size_t flen;
-                if (videoSrc->nextVideoFrame(&data, &flen))
-                    sendVideoFrame(data, flen);
+                int fps = videoSrc->videoFps() > 0 ? videoSrc->videoFps() : 10;
+                unsigned long interval = 1000 / fps;
+                if (millis() - lastFrameMs >= interval)
+                {
+                    lastFrameMs = millis();
+                    const uint8_t *data;
+                    size_t flen;
+                    if (videoSrc->nextVideoFrame(&data, &flen))
+                        sendVideoFrame(data, flen);
+                }
             }
-#endif
 
-            // Audio: manda todos los chunks disponibles (cada 20ms hay uno)
-            if (hasAudio && audioSrc)
+            // Audio: manda los chunks disponibles (cada 20ms hay uno). Idem:
+            // negociado Y activado en vivo.
+            if (hasAudio && audioActivo && audioSrc)
             {
                 const uint8_t *achunk;
                 size_t alen;

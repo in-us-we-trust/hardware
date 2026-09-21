@@ -1,10 +1,11 @@
 #include "WebPortal.h"
+#include "Config.h"
 #include <WebServer.h>
 #include <WiFi.h>
 
 namespace
 {
-    WebServer server(80);
+    WebServer server(Config::Http::PORT);
     String bleNameGlobal;
 
     WiFiClient sseClient;
@@ -69,28 +70,14 @@ var qrcode=function(){var qrcode=function(typeNumber,errorCorrectionLevel){var P
             "\r\n");
         sseClient.print("data: Esperando credenciales por BLE...\n\n");
     }
-}
 
-namespace WebPortal
-{
-    void sendSSE(const String &message)
+    // --- Levantar la red segun entorno --------------------------------------
+    // Wokwi no simula el modo AP: la unica red virtual es "Wokwi-GUEST"
+    // (abierta, canal 6) y el ESP solo puede actuar como estacion. Nos
+    // conectamos ahi y servimos la misma pagina; el host la alcanza por el
+    // port forward declarado en wokwi.toml.
+    void startWokwiStation()
     {
-        if (sseConnected && sseClient.connected())
-        {
-            sseClient.print("data: " + message + "\n\n");
-        }
-        Serial.println("[SSE] " + message);
-    }
-
-    void begin(const String &bleName)
-    {
-        bleNameGlobal = bleName;
-
-#ifdef WOKWI_SIM
-        // Wokwi no simula el modo AP: la unica red virtual es "Wokwi-GUEST"
-        // (abierta, canal 6) y el ESP solo puede actuar como estacion. Nos
-        // conectamos ahi y servimos la misma pagina; el host la alcanza por el
-        // port forward declarado en wokwi.toml.
         WiFi.mode(WIFI_STA);
         WiFi.begin("Wokwi-GUEST", "", 6);
         Serial.print("\n[WOKWI] Conectando a Wokwi-GUEST");
@@ -112,7 +99,11 @@ namespace WebPortal
             Serial.println(WiFi.localIP());
             Serial.println("[WOKWI] Abri http://localhost:8180");
         }
-#else
+    }
+
+    // Hardware real: levantamos el Access Point propio para el portal.
+    void startAccessPoint()
+    {
         WiFi.mode(WIFI_AP);
         WiFi.softAP(bleNameGlobal.c_str());
         Serial.println("\nAccess Point iniciado");
@@ -120,7 +111,32 @@ namespace WebPortal
         Serial.println(bleNameGlobal);
         Serial.print("IP: ");
         Serial.println(WiFi.softAPIP());
-#endif
+    }
+}
+
+namespace WebPortal
+{
+    void sendSSE(const String &message)
+    {
+        if (sseConnected && sseClient.connected())
+        {
+            sseClient.print("data: " + message + "\n\n");
+        }
+        Serial.println("[SSE] " + message);
+    }
+
+    void begin(const String &bleName)
+    {
+        bleNameGlobal = bleName;
+
+        if (Config::Env::IS_WOKWI_SIM)
+        {
+            startWokwiStation();
+        }
+        else
+        {
+            startAccessPoint();
+        }
 
         server.on("/", handleRoot);
         server.on("/qr.js", handleQrJs);

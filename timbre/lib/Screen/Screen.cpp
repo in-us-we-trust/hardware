@@ -1,10 +1,11 @@
 #include "Screen.h"
+#include "Config.h"
 #include <WebServer.h>
 #include <WiFi.h>
 
 namespace
 {
-  WebServer server(80);
+  WebServer server(Config::Http::PORT);
   bool started = false;
 
   WiFiClient sseClient;

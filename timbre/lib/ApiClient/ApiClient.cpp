@@ -1,15 +1,18 @@
 #include "ApiClient.h"
 #include "Certs.h"
+#include "Config.h"
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <ArduinoJson.h>
 
 namespace
 {
-    // Host del gateway para SNI/verificacion TLS.
-    const char *GATEWAY_HOST = "api.hogarseguro.local";
-    const IPAddress GATEWAY_IP(34, 120, 207, 250);
-    const uint16_t GATEWAY_PORT = 443;
+    // Gateway (host/IP/puerto): definidos en Config::Api. La IP se arma aca
+    // como IPAddress a partir de los 4 octetos (IPAddress no es constexpr).
+    const char *GATEWAY_HOST = Config::Api::GATEWAY_HOST;
+    const IPAddress GATEWAY_IP(Config::Api::GATEWAY_IP[0], Config::Api::GATEWAY_IP[1],
+                              Config::Api::GATEWAY_IP[2], Config::Api::GATEWAY_IP[3]);
+    const uint16_t GATEWAY_PORT = Config::Api::GATEWAY_PORT;
 
     // Solo se usa si llaman a ApiClient::setDeviceIdHeader() (mTLS apagado).
     String deviceIdHeaderOverride = "";
@@ -17,10 +20,10 @@ namespace
     bool doPost(const String &path, const String &jsonBody, String *responseBody, bool acceptConflict)
 {
     WiFiClientSecure client;
-    
+
     // 1. TIMEOUT: Evita cortes a mitad del handshake mTLS
-    client.setTimeout(15000); 
-    client.setHandshakeTimeout(15000);
+    client.setTimeout(Config::Api::TLS_TIMEOUT_MS);
+    client.setHandshakeTimeout(Config::Api::TLS_TIMEOUT_MS);
     client.setCACert(CA_CERT);
     client.setCertificate(DEVICE_CERT);
     client.setPrivateKey(DEVICE_KEY);
@@ -169,7 +172,7 @@ namespace ApiClient
         Serial.println("[ApiClient] body final /devices:");
         Serial.println(jsonBody);
 
-        return doPost("/api/v1/devices", jsonBody, responseBody, true);
+        return doPost(Config::Api::PATH_DEVICES, jsonBody, responseBody, true);
     }
 
     bool sendEvent(const String &type,
@@ -184,6 +187,6 @@ namespace ApiClient
         Serial.println("[ApiClient] body final /events:");
         Serial.println(jsonBody);
 
-        return doPost("/api/v1/events", jsonBody, responseBody, false);
+        return doPost(Config::Api::PATH_EVENTS, jsonBody, responseBody, false);
     }
 }

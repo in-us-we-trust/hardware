@@ -3,7 +3,7 @@
 #include "MediaSource.h"
 
 // ---------------------------------------------------------------------------
-// EventFlow: POLITICA + ciclo de vida. Encapsula a DoorbellSession (el main no
+// EventFlow: POLITICA + ciclo de vida. Encapsula a BackendSession (el main no
 // lo toca). Maneja el evento del timbre como una MAQUINA DE ESTADOS no
 // bloqueante:
 //
@@ -20,8 +20,8 @@
 namespace EventFlow
 {
     // Configura la capa. deviceId para el transporte; source de donde sacar la
-    // foto (mock hoy, camara manana). Adentro hace DoorbellSession::begin.
-    void begin(const String &deviceId, MediaSource *source);
+    // foto (mock hoy, camara manana). Adentro hace BackendSession::initialize.
+    void initialize(const String &deviceId, MediaSource *source);
 
     // Se llama al tocar el timbre: arranca conexion + saca la foto (no bloquea).
     void onTimbre();
