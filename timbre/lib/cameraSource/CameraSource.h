@@ -30,6 +30,9 @@ public:
     // Foto para el press / provisioning BLE (base64). Thread-safe.
     String captureBase64();
 
+    // Codifica un JPEG ya capturado (p.ej. con captureFrameCopy) a base64.
+    static String toBase64(const uint8_t *data, size_t len);
+
     bool ready() const { return _ready; }
 
 private:

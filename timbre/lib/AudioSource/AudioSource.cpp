@@ -19,6 +19,10 @@ namespace
     // oficiales amplifican x16. Ajustar si satura (bajar) o queda flojo (subir).
     const float MIC_GAIN = 16.0f;
 
+    // Al arrancar, el filtro PDM y el seguimiento del DC tiran basura (picos
+    // enormes) unos cientos de ms. Ese tiempo se lee y se descarta.
+    const uint32_t MIC_WARMUP_MS = 400;
+
     // G.711 u-law encoder (ITU-T G.711).
     uint8_t pcm16_to_ulaw(int16_t pcm)
     {
@@ -104,6 +108,8 @@ bool AudioSource::begin()
 
     _pcmCount = 0;
     _chunkReady = false;
+    _level = 0;
+    _warmupUntilMs = millis() + MIC_WARMUP_MS;
     _ready = true;
     Serial.println("[MIC] PDM listo (16kHz -> G.711 u-law 8kHz, gain x16)");
     return true;
@@ -122,6 +128,7 @@ void AudioSource::end()
         _ready = false;
         _chunkReady = false;
         _pcmCount = 0;
+        _level = 0;
         Serial.println("[MIC] apagado");
     }
 #endif
@@ -146,9 +153,12 @@ void AudioSource::loop()
     // El mic PDM tiene un offset DC (~1300). Lo estimamos con un promedio movil
     // y lo restamos, asi el audio queda centrado en 0 antes de amplificar.
     static float dcOffset = 1300.0f;
+    bool warmup = (long)(millis() - _warmupUntilMs) < 0;
     for (size_t i = 0; i < samplesRead; i++)
     {
         dcOffset += (tmpBuf[i] - dcOffset) * 0.001f; // seguimiento lento del DC
+        if (warmup)
+            continue; // descartamos, pero el DC ya va convergiendo
         int16_t centered = (int16_t)(tmpBuf[i] - dcOffset);
         _pcmBuf[_pcmCount++] = applyGain(centered);
         if (_pcmCount >= AUDIO_PCM_SAMPLES_PER_CHUNK)

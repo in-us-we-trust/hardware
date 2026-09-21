@@ -192,26 +192,27 @@ bool CameraSource::captureFrameCopy(uint8_t *dest, size_t destCap, size_t *outLe
 String CameraSource::captureBase64()
 {
     xSemaphoreTake(_mutex, portMAX_DELAY);
-    bool ok = captureIntoBuffer();
-    if (!ok)
-    {
-        xSemaphoreGive(_mutex);
-        return "";
-    }
+    String encoded = captureIntoBuffer() ? toBase64(_buf, _len) : String("");
+    xSemaphoreGive(_mutex);
+    return encoded;
+}
 
-    size_t outputLen = 4 * ((_len + 2) / 3);
+String CameraSource::toBase64(const uint8_t *data, size_t len)
+{
+    if (!data || len == 0)
+        return "";
+
+    size_t outputLen = 4 * ((len + 2) / 3);
     char *output = (char *)malloc(outputLen + 1);
     if (!output)
     {
-        xSemaphoreGive(_mutex);
         Serial.println("[CAM] sin memoria para base64");
         return "";
     }
 
     size_t actualLen = 0;
     int rc = mbedtls_base64_encode(
-        (unsigned char *)output, outputLen + 1, &actualLen, _buf, _len);
-    xSemaphoreGive(_mutex);
+        (unsigned char *)output, outputLen + 1, &actualLen, data, len);
 
     if (rc != 0)
     {

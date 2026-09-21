@@ -7,6 +7,7 @@
 #include "AudioSource.h"
 #include "PowerMode.h"
 #include "Config.h"
+#include "PersonDetector.h"
 
 #include <WiFi.h>
 #include <WiFiServer.h>
@@ -42,6 +43,37 @@ namespace
     // entre chequeos se pierde. loop() va acumulando el maximo y haySonido()
     // lo consume.
     uint16_t picoAudio = 0;
+
+    // Que ya se detecto en este intento de sesion. Se fijan al disparar la
+    // conexion; en EN_SESION solo se chequea lo que sigue en false.
+    bool audioDetectado = false;
+    bool videoDetectado = false;
+
+    // Foto del evento (JPEG, PSRAM). onTimbre la saca apenas se toca el timbre;
+    // hayPersonaEnFrame() analiza esa primero y despues va capturando frames
+    // nuevos. El press manda la ultima foto analizada.
+    uint8_t *foto = nullptr;
+    size_t fotoLen = 0;
+    bool fotoSinAnalizar = false; // la foto del timbre todavia no paso por el modelo
+
+    bool capturarFoto()
+    {
+        if (!foto)
+            foto = (uint8_t *)ps_malloc(Config::Event::FOTO_BUF_SIZE);
+        if (!foto)
+        {
+            Serial.println("[FLOW] sin memoria para la foto");
+            fotoLen = 0;
+            return false;
+        }
+        if (!Camera.captureFrameCopy(foto, Config::Event::FOTO_BUF_SIZE, &fotoLen))
+        {
+            Serial.println("[FLOW] no se pudo capturar la foto");
+            fotoLen = 0;
+            return false;
+        }
+        return true;
+    }
 
     volatile bool hangupPedido = false;
 
@@ -136,6 +168,10 @@ namespace
             BackendSession::cerrarSesion(trackId);
 
         backend = Backend::OFF;
+        audioDetectado = false;
+        videoDetectado = false;
+        fotoSinAnalizar = false;
+        fotoLen = 0;
 
         stopMjpegTask();
         Microphone.end();
@@ -145,9 +181,18 @@ namespace
         PowerMode::low(); // camara off + 80MHz + WiFi sleep
     }
 
-        bool hayPersonaEnFrame()
+    // VIDEO: corre el tiny model (PersonDetector) sobre la foto del timbre si
+    // todavia no se analizo; si no, sobre un frame nuevo.
+    bool hayPersonaEnFrame()
     {
-        return false; // <-- reemplazar por la salida del tiny model
+        if (fotoSinAnalizar)
+            fotoSinAnalizar = false;
+        else if (!capturarFoto())
+            return false;
+
+        if (fotoLen == 0)
+            return false;
+        return PersonDetector::detectJpeg(foto, fotoLen);
     }
 
     // AUDIO: hay sonido si el pico del microfono desde el ultimo chequeo supera
@@ -157,7 +202,6 @@ namespace
         uint16_t pico = picoAudio;
         picoAudio = 0;
         return pico >= Config::Event::AUDIO_ACTIVATE_LEVEL;
-        return false;
     }
 
     void mostrarEnScreen(const MqttClient::IaResponse &r)
@@ -220,6 +264,9 @@ namespace EventFlow
         PowerMode::high(); // CPU full + WiFi sin sleep + camara on
         Microphone.begin();
 
+        // Foto del timbre: se saca ya y es la primera que analiza el tiny model.
+        fotoSinAnalizar = capturarFoto();
+
         // Alimenta el visor que ve el usuario. Es un task que funciona en el 2do core
         startMjpegTask();
         hangupPedido = false;
@@ -281,9 +328,14 @@ namespace EventFlow
                     Screen::showMessage("Persona detectada en el timbre");
                 if (sonido || persona)
                 {
-                    BackendSession::conectar();
+                    // Lo detectado queda prendido toda la sesion; en EN_SESION
+                    // solo se sigue chequeando lo que falta.
+                    audioDetectado = sonido;
+                    videoDetectado = persona;
+                    // BackendSession::conectar();
                     conectandoDesde = millis();
-                    backend = Backend::CONECTANDO;
+                    backend = Backend::EN_SESION;
+                    // backend = Backend::CONECTANDO;
                 }
                 else
                 {
@@ -292,58 +344,72 @@ namespace EventFlow
             }
         }
 
+        // En sesion, lo ya detectado no se re-analiza: solo se chequea lo que
+        // falta y, al detectarlo, se prende y queda prendido.
         if (backend == Backend::EN_SESION)
         {
             static unsigned long lastAudioDetectMs = 0;
-            if (millis() - lastAudioDetectMs >= Config::Event::AUDIO_DETECT_INTERVAL_MS)
+            if (!audioDetectado &&
+                millis() - lastAudioDetectMs >= Config::Event::AUDIO_DETECT_INTERVAL_MS)
             {
                 lastAudioDetectMs = millis();
-                bool sonido = haySonido();
-                if (sonido)
+                if (haySonido())
                 {
-                    Screen::showMessage("Audio entrante detectada en el timbre");
+                    audioDetectado = true;
+                    Screen::showMessage(videoDetectado
+                                            ? "Persona y audio detectada en el timbre. Analizando analisis inteligente..."
+                                            : "Audio entrante detectada en el timbre");
+                    BackendSession::activarAudio(true);
                 }
-                BackendSession::activarAudio(sonido);
             }
 
             static unsigned long lastVideoDetectMs = 0;
-            if (millis() - lastVideoDetectMs >= Config::Event::VIDEO_DETECT_INTERVAL_MS)
+            if (!videoDetectado &&
+                millis() - lastVideoDetectMs >= Config::Event::VIDEO_DETECT_INTERVAL_MS)
             {
                 lastVideoDetectMs = millis();
-                bool persona = hayPersonaEnFrame();
-                if (persona)
+                if (hayPersonaEnFrame())
                 {
-                    Screen::showMessage("Persona detectada en el timbre");
+                    videoDetectado = true;
+                    Screen::showMessage(audioDetectado
+                                            ? "Persona y audio detectada en el timbre. Analizando analisis inteligente..."
+                                            : "Persona detectada en el timbre");
+                    BackendSession::activarVideo(true);
                 }
-                BackendSession::activarVideo(persona);
             }
         }
 
-        if (backend == Backend::CONECTANDO)
-        {
-            if (BackendSession::estaListo())
-            {
-                if (!BackendSession::enviarFotoBase64(trackId, Camera.captureBase64()))
-                {
-                    Serial.println("[FLOW] fallo el press: backend OFF, sigo evaluando (el evento local sigue)");
-                    backend = Backend::OFF;
-                }
-                else
-                {
-                    Serial.printf("[FLOW] sesion de backend iniciada trackId=%s\n", trackId.c_str());
-                    backend = Backend::EN_SESION;
+        // bloque comentado hasta tener el backend listo nuevamente
+        // if (backend == Backend::CONECTANDO)
+        // {
+        //     if (BackendSession::estaListo())
+        //     {
+        //         // Si todavia no hay foto (fallo la del timbre), sacamos una ahora.
+        //         if (fotoLen == 0)
+        //             capturarFoto();
+        //         if (!BackendSession::enviarFotoBase64(trackId, CameraSource::toBase64(foto, fotoLen)))
+        //         {
+        //             Serial.println("[FLOW] fallo el press: backend OFF, sigo evaluando (el evento local sigue)");
+        //             backend = Backend::OFF;
+        //         }
+        //         else
+        //         {
+        //             Serial.printf("[FLOW] sesion de backend iniciada trackId=%s\n", trackId.c_str());
+        //             backend = Backend::EN_SESION;
 
-                    // Negocia video+audio, pero arranca sin enviar nada. Que se
-                    // manda realmente lo decide EventFlow en vivo (ver loop()).
-                    BackendSession::iniciarMedia();
-                }
-            }
-            else if (millis() - conectandoDesde > Config::Event::BACKEND_CONNECT_TIMEOUT_MS)
-            {
-                Serial.println("[FLOW] timeout conectando backend: backend OFF, sigo evaluando (sigue el local)");
-                backend = Backend::OFF;
-            }
-        }
+        //             // Negocia video+audio y prende de entrada lo que disparo la
+        //             // conexion. Lo que falta lo prende loop() al detectarlo.
+        //             BackendSession::iniciarMedia();
+        //             BackendSession::activarAudio(audioDetectado);
+        //             BackendSession::activarVideo(videoDetectado);
+        //         }
+        //     }
+        //     else if (millis() - conectandoDesde > Config::Event::BACKEND_CONNECT_TIMEOUT_MS)
+        //     {
+        //         Serial.println("[FLOW] timeout conectando backend: backend OFF, sigo evaluando (sigue el local)");
+        //         backend = Backend::OFF;
+        //     }
+        // }
 
         if (hangupPedido)
         {

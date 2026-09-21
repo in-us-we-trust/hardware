@@ -54,6 +54,7 @@ private:
     uint8_t _ulawBuf[AUDIO_CHUNK_SAMPLES];
 
     uint16_t _level = 0; // amplitud RMS del ultimo chunk
+    unsigned long _warmupUntilMs = 0; // hasta cuando se descarta el audio tras begin()
 
     void encodeChunk(); // downsample + u-law encode
 

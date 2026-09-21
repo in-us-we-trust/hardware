@@ -6,6 +6,7 @@
 #include "EventFlow.h"
 #include "PowerMode.h"
 #include "MockMediaSource.h"
+#include "PersonDetector.h"
 
 #include <Arduino.h>
 
@@ -59,6 +60,7 @@ namespace ModoOperacion
 
         Screen::begin();                              // Visor
         EventFlow::initialize(deviceId, &fotoSource); // Lo inicializa. Pero no comienza hasta onTimbre
+        PersonDetector::begin();                      // TFLite + tensor arena en PSRAM
 
         // Arrancamos en reposo: camara off, CPU 80MHz, WiFi modem sleep.
         PowerMode::low();

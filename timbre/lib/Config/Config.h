@@ -132,7 +132,11 @@ namespace Config
         // Umbral de nivel de microfono (0..32767) para considerar que "hay
         // sonido" y empezar a mandar audio. TODO: ajustar en campo (el gate de
         // ruido base de la pantalla ronda 800).
-        constexpr uint16_t AUDIO_ACTIVATE_LEVEL = 800;
+        constexpr uint16_t AUDIO_ACTIVATE_LEVEL = 6000;
+
+        // Buffer (PSRAM) de la foto del evento: la que analiza el tiny model y
+        // la que viaja en el press. Mismo tope que un frame MJPEG.
+        constexpr size_t FOTO_BUF_SIZE = 100 * 1024;
     }
 
     // --- Stream MJPEG local (EventFlow, core 0) -----------------------------
