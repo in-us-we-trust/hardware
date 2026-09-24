@@ -8,8 +8,6 @@
 namespace Storage
 {
     // --- Identidad del dispositivo (namespace "device") ---
-    String loadDeviceId();
-    void saveDeviceId(const String &id);
     bool loadDeviceRegistered();
     void saveDeviceRegistered(bool registered);
 

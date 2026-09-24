@@ -24,10 +24,11 @@ namespace
 {
     enum class Backend
     {
-        OFF,        // sin sesion de backend: con evento activo, re-evalua cada
-                    // EVAL_INTERVAL_MS si hay motivo (sonido/persona) para conectar
-        CONECTANDO, // conectando al broker MQTT
-        EN_SESION   // press enviado, publicando media
+        OFF,            // sin sesion de backend: con evento activo, re-evalua cada
+                        // EVAL_INTERVAL_MS si hay motivo (sonido/persona) para conectar
+        CONECTANDO,     // conectando al broker MQTT
+        ABRIENDO_MEDIA, // MQTT listo; negociando RTSPS (tiene que quedar ready ANTES del press)
+        EN_SESION       // press enviado, publicando media
     };
 
     MediaSource *src = nullptr;
@@ -35,6 +36,7 @@ namespace
     bool eventoActivo = false;
     Backend backend = Backend::OFF;
     unsigned long conectandoDesde = 0;
+    unsigned long mediaDesde = 0;
     unsigned long ultimaEvaluacionMs = 0;
     String trackId = "";
 
@@ -229,6 +231,27 @@ namespace
     }
 }
 
+namespace
+{
+    // Publica el press (con la foto) y pasa a EN_SESION. Se llama con el RTSP
+    // ya ready o, si el RTSP fallo, igual: el gateway analiza al menos la IMAGE.
+    void enviarPress()
+    {
+        // Si todavia no hay foto (fallo la del timbre), sacamos una ahora.
+        if (fotoLen == 0)
+            capturarFoto();
+        if (!BackendSession::enviarFotoBase64(trackId, CameraSource::toBase64(foto, fotoLen)))
+        {
+            Serial.println("[FLOW] fallo el press: backend OFF, sigo evaluando (el evento local sigue)");
+            BackendSession::cerrarSesion(trackId); // frena el RTSP si habia quedado abierto
+            backend = Backend::OFF;
+            return;
+        }
+        Serial.printf("[FLOW] sesion de backend iniciada trackId=%s\n", trackId.c_str());
+        backend = Backend::EN_SESION;
+    }
+}
+
 namespace EventFlow
 {
     void initialize(const String &deviceId, MediaSource *source)
@@ -332,10 +355,9 @@ namespace EventFlow
                     // solo se sigue chequeando lo que falta.
                     audioDetectado = sonido;
                     videoDetectado = persona;
-                    // BackendSession::conectar();
+                    BackendSession::conectar();
                     conectandoDesde = millis();
-                    backend = Backend::EN_SESION;
-                    // backend = Backend::CONECTANDO;
+                    backend = Backend::CONECTANDO;
                 }
                 else
                 {
@@ -374,42 +396,55 @@ namespace EventFlow
                     Screen::showMessage(audioDetectado
                                             ? "Persona y audio detectada en el timbre. Analizando analisis inteligente..."
                                             : "Persona detectada en el timbre");
-                    BackendSession::activarVideo(true);
+                    // BackendSession::activarVideo(true);
                 }
             }
         }
 
-        // bloque comentado hasta tener el backend listo nuevamente
-        // if (backend == Backend::CONECTANDO)
-        // {
-        //     if (BackendSession::estaListo())
-        //     {
-        //         // Si todavia no hay foto (fallo la del timbre), sacamos una ahora.
-        //         if (fotoLen == 0)
-        //             capturarFoto();
-        //         if (!BackendSession::enviarFotoBase64(trackId, CameraSource::toBase64(foto, fotoLen)))
-        //         {
-        //             Serial.println("[FLOW] fallo el press: backend OFF, sigo evaluando (el evento local sigue)");
-        //             backend = Backend::OFF;
-        //         }
-        //         else
-        //         {
-        //             Serial.printf("[FLOW] sesion de backend iniciada trackId=%s\n", trackId.c_str());
-        //             backend = Backend::EN_SESION;
+        if (backend == Backend::CONECTANDO)
+        {
+            if (BackendSession::estaListo())
+            {
+                // Contrato: el path RTSP tiene que estar ready ANTES del press
+                // (si no, el PLAY del gateway da 404 y no hay VIDEO/AUDIO).
+                if (BackendSession::iniciarMedia(trackId))
+                {
+                    mediaDesde = millis();
+                    backend = Backend::ABRIENDO_MEDIA;
+                }
+                else
+                {
+                    Serial.println("[FLOW] RTSP no arranco: mando el press igual (solo IMAGE)");
+                    enviarPress();
+                }
+            }
+            else if (millis() - conectandoDesde > Config::Event::BACKEND_CONNECT_TIMEOUT_MS)
+            {
+                Serial.println("[FLOW] timeout conectando backend: backend OFF, sigo evaluando (sigue el local)");
+                backend = Backend::OFF;
+            }
+        }
 
-        //             // Negocia video+audio y prende de entrada lo que disparo la
-        //             // conexion. Lo que falta lo prende loop() al detectarlo.
-        //             BackendSession::iniciarMedia();
-        //             BackendSession::activarAudio(audioDetectado);
-        //             BackendSession::activarVideo(videoDetectado);
-        //         }
-        //     }
-        //     else if (millis() - conectandoDesde > Config::Event::BACKEND_CONNECT_TIMEOUT_MS)
-        //     {
-        //         Serial.println("[FLOW] timeout conectando backend: backend OFF, sigo evaluando (sigue el local)");
-        //         backend = Backend::OFF;
-        //     }
-        // }
+        if (backend == Backend::ABRIENDO_MEDIA)
+        {
+            if (BackendSession::mediaLista())
+            {
+                // Prender lo detectado ANTES del press: el gateway hace PLAY
+                // enseguida y MediaMTX corta al publisher que no manda datos en
+                // 10 s. Lo que falta lo prende loop() (EN_SESION) al detectarlo.
+                BackendSession::activarAudio(audioDetectado);
+                BackendSession::activarVideo(videoDetectado);
+                Serial.println("[FLOW] RTSP ready -> mando el press");
+                enviarPress();
+            }
+            else if (BackendSession::mediaFallo() ||
+                     millis() - mediaDesde > Config::Event::RTSP_READY_TIMEOUT_MS)
+            {
+                Serial.println("[FLOW] RTSP no quedo ready: mando el press igual (solo IMAGE)");
+                BackendSession::cerrarSesion(trackId); // frena el RTSP a medio negociar
+                enviarPress();
+            }
+        }
 
         if (hangupPedido)
         {

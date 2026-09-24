@@ -25,20 +25,55 @@
 #define MQTT_BROKER_HOST "test.mosquitto.org"
 #endif
 #ifndef MQTT_BROKER_PORT
-#define MQTT_BROKER_PORT 1883
+#define MQTT_BROKER_PORT 8883
+#endif
+// Nombre contra el que se valida el server cert del broker (no tiene por que
+// ser MQTT_BROKER_HOST). El cert de la VM tiene SAN IP:34.27.42.246 y
+// DNS:localhost, pero el mbedtls 2.28 de Arduino-ESP32 2.x NO sabe matchear
+// SANs de tipo IP: validar contra la IP da "CN mismatch". Por eso se valida
+// contra "localhost" (la cadena igual se verifica contra nuestra CA privada).
+// Si se reemite server.pem con un DNS SAN propio (p. ej. mqtt.hogarseguro.local),
+// cambiar este flag a ese nombre.
+#ifndef MQTT_TLS_HOSTNAME
+#define MQTT_TLS_HOSTNAME "localhost"
 #endif
 #ifndef MEDIAMTX_HOST
 #define MEDIAMTX_HOST "192.168.1.69"
 #endif
 #ifndef MEDIAMTX_PORT
-#define MEDIAMTX_PORT 8554
+#define MEDIAMTX_PORT 8322
+#endif
+// Igual que MQTT_TLS_HOSTNAME: MediaMTX usa el mismo server.pem (SAN IP) y el
+// mbedtls 2.28 del ESP32 no matchea SANs de tipo IP.
+#ifndef MEDIAMTX_TLS_HOSTNAME
+#define MEDIAMTX_TLS_HOSTNAME "localhost"
+#endif
+// User RTSP = deviceId (authInternalUsers en mediamtx.secure.yml). Solo puede
+// publicar en paths que empiezan con {deviceId}/.
+#ifndef MEDIAMTX_USER
+#define MEDIAMTX_USER DEVICE_ID
+#endif
+#ifndef MEDIAMTX_PASS
+#error "Falta -DMEDIAMTX_PASS en platformio.ini (pass RTSP del device en mediamtx.secure.yml)"
 #endif
 #ifndef MEDIAMTX_PATH
 #define MEDIAMTX_PATH "doorbell"
 #endif
 
+// --- Identidad del dispositivo ----------------------------------------------
+// Sin default a proposito: tiene que coincidir con el CN del certificado del
+// dispositivo (lib/Certs/certs/device.pem). Se define en platformio.ini.
+#ifndef DEVICE_ID
+#error "Falta -DDEVICE_ID en platformio.ini (tiene que ser el CN de device.pem)"
+#endif
+
 namespace Config
 {
+    namespace Identity
+    {
+        constexpr const char *ID = DEVICE_ID;
+    }
+
     // --- Entorno de build: hardware real vs. simulador Wokwi ----------------
     // Wokwi no simula camara, BLE ni modo AP. En vez de #ifdef WOKWI_SIM
     // repartidos por el codigo, un solo bool que se puede usar con "if" normal.
@@ -114,6 +149,9 @@ namespace Config
     namespace Event
     {
         constexpr uint32_t BACKEND_CONNECT_TIMEOUT_MS = 10000;
+        // Cuanto esperar a que el RTSPS quede ready (TLS + ANNOUNCE/SETUP/RECORD)
+        // antes de mandar el press igual (solo IMAGE).
+        constexpr uint32_t RTSP_READY_TIMEOUT_MS = 8000;
         constexpr uint32_t AUDIO_LEVEL_THROTTLE_MS = 120; // push nivel a Screen
 
         // Con el stream local ya corriendo, cada cuanto se re-evalua si hay
@@ -165,6 +203,7 @@ namespace Config
     {
         constexpr const char *BROKER_HOST = MQTT_BROKER_HOST;
         constexpr uint16_t BROKER_PORT = MQTT_BROKER_PORT;
+        constexpr const char *TLS_HOSTNAME = MQTT_TLS_HOSTNAME;
     }
 
     // --- MediaMTX / RTSP (BackendSession, RtspPublisher) -------------------
@@ -172,7 +211,10 @@ namespace Config
     {
         constexpr const char *HOST = MEDIAMTX_HOST;
         constexpr uint16_t PORT = MEDIAMTX_PORT;
-        constexpr const char *PATH = MEDIAMTX_PATH;
+        constexpr const char *PATH = MEDIAMTX_PATH; // segmento del medio: {deviceId}/doorbell/{trackId}
+        constexpr const char *TLS_HOSTNAME = MEDIAMTX_TLS_HOSTNAME;
+        constexpr const char *USER = MEDIAMTX_USER;
+        constexpr const char *PASS = MEDIAMTX_PASS;
     }
 
     // --- Gateway HTTP mTLS (ApiClient) --------------------------------------

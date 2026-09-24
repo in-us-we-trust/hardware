@@ -1,0 +1,866 @@
+diff --git a/timbre/lib/BackendSession/BackendSession.cpp b/timbre/lib/BackendSession/BackendSession.cpp
+index 399e3a9..8a35cf0 100644
+--- a/timbre/lib/BackendSession/BackendSession.cpp
++++ b/timbre/lib/BackendSession/BackendSession.cpp
+@@ -14,12 +14,6 @@ namespace
+ 
+     BackendSession::RespuestaHandler respuestaHandler = nullptr;
+ 
+-    String rtspUrl()
+-    {
+-        return String("rtsp://") + Config::Media::HOST + ":" + String(Config::Media::PORT) +
+-               "/" + Config::Media::PATH;
+-    }
+-
+     // Codifica bytes crudos a base64 (para el campo image del press, MQTT).
+     String toBase64(const uint8_t *data, size_t len)
+     {
+@@ -40,8 +34,8 @@ namespace
+         return result;
+     }
+ 
+-    // Se invoca con cada ia_response ya filtrado por deviceId (MqttClient).
+-    // Aca filtramos por trackId y reenviamos a EventFlow.
++    // Se invoca con cada ia_response de este device (el topico ya es
++    // home/{deviceId}/...). Aca filtramos por trackId y reenviamos a EventFlow.
+     void handleIaResponse(const MqttClient::IaResponse &r)
+     {
+         if (!active || r.trackId != trackId)
+@@ -105,7 +99,7 @@ namespace BackendSession
+         // El trackId lo genera EventFlow; aca lo guardamos como sesion activa
+         // (para filtrar ia_response) y lo usamos como eventId del press.
+         trackId = id;
+-        bool ok = MqttClient::publishPress(trackId, rtspUrl(), fotoBase64);
++        bool ok = MqttClient::publishPress(trackId, fotoBase64);
+         if (!ok)
+         {
+             Serial.println("[SESSION] no se pudo publicar el press");
+diff --git a/timbre/lib/Config/Config.h b/timbre/lib/Config/Config.h
+index d58312e..d1aeaca 100644
+--- a/timbre/lib/Config/Config.h
++++ b/timbre/lib/Config/Config.h
+@@ -25,7 +25,17 @@
+ #define MQTT_BROKER_HOST "test.mosquitto.org"
+ #endif
+ #ifndef MQTT_BROKER_PORT
+-#define MQTT_BROKER_PORT 1883
++#define MQTT_BROKER_PORT 8883
++#endif
++// Nombre contra el que se valida el server cert del broker (no tiene por que
++// ser MQTT_BROKER_HOST). El cert de la VM tiene SAN IP:34.27.42.246 y
++// DNS:localhost, pero el mbedtls 2.28 de Arduino-ESP32 2.x NO sabe matchear
++// SANs de tipo IP: validar contra la IP da "CN mismatch". Por eso se valida
++// contra "localhost" (la cadena igual se verifica contra nuestra CA privada).
++// Si se reemite server.pem con un DNS SAN propio (p. ej. mqtt.hogarseguro.local),
++// cambiar este flag a ese nombre.
++#ifndef MQTT_TLS_HOSTNAME
++#define MQTT_TLS_HOSTNAME "localhost"
+ #endif
+ #ifndef MEDIAMTX_HOST
+ #define MEDIAMTX_HOST "192.168.1.69"
+@@ -177,6 +187,7 @@ namespace Config
+     {
+         constexpr const char *BROKER_HOST = MQTT_BROKER_HOST;
+         constexpr uint16_t BROKER_PORT = MQTT_BROKER_PORT;
++        constexpr const char *TLS_HOSTNAME = MQTT_TLS_HOSTNAME;
+     }
+ 
+     // --- MediaMTX / RTSP (BackendSession, RtspPublisher) -------------------
+diff --git a/timbre/lib/EventFlow/EventFlow.cpp b/timbre/lib/EventFlow/EventFlow.cpp
+index f2b59a8..f4a61b9 100644
+--- a/timbre/lib/EventFlow/EventFlow.cpp
++++ b/timbre/lib/EventFlow/EventFlow.cpp
+@@ -332,10 +332,9 @@ namespace EventFlow
+                     // solo se sigue chequeando lo que falta.
+                     audioDetectado = sonido;
+                     videoDetectado = persona;
+-                    // BackendSession::conectar();
++                    BackendSession::conectar();
+                     conectandoDesde = millis();
+-                    backend = Backend::EN_SESION;
+-                    // backend = Backend::CONECTANDO;
++                    backend = Backend::CONECTANDO;
+                 }
+                 else
+                 {
+@@ -379,37 +378,36 @@ namespace EventFlow
+             }
+         }
+ 
+-        // bloque comentado hasta tener el backend listo nuevamente
+-        // if (backend == Backend::CONECTANDO)
+-        // {
+-        //     if (BackendSession::estaListo())
+-        //     {
+-        //         // Si todavia no hay foto (fallo la del timbre), sacamos una ahora.
+-        //         if (fotoLen == 0)
+-        //             capturarFoto();
+-        //         if (!BackendSession::enviarFotoBase64(trackId, CameraSource::toBase64(foto, fotoLen)))
+-        //         {
+-        //             Serial.println("[FLOW] fallo el press: backend OFF, sigo evaluando (el evento local sigue)");
+-        //             backend = Backend::OFF;
+-        //         }
+-        //         else
+-        //         {
+-        //             Serial.printf("[FLOW] sesion de backend iniciada trackId=%s\n", trackId.c_str());
+-        //             backend = Backend::EN_SESION;
+-
+-        //             // Negocia video+audio y prende de entrada lo que disparo la
+-        //             // conexion. Lo que falta lo prende loop() al detectarlo.
+-        //             BackendSession::iniciarMedia();
+-        //             BackendSession::activarAudio(audioDetectado);
+-        //             BackendSession::activarVideo(videoDetectado);
+-        //         }
+-        //     }
+-        //     else if (millis() - conectandoDesde > Config::Event::BACKEND_CONNECT_TIMEOUT_MS)
+-        //     {
+-        //         Serial.println("[FLOW] timeout conectando backend: backend OFF, sigo evaluando (sigue el local)");
+-        //         backend = Backend::OFF;
+-        //     }
+-        // }
++        if (backend == Backend::CONECTANDO)
++        {
++            if (BackendSession::estaListo())
++            {
++                // Si todavia no hay foto (fallo la del timbre), sacamos una ahora.
++                if (fotoLen == 0)
++                    capturarFoto();
++                if (!BackendSession::enviarFotoBase64(trackId, CameraSource::toBase64(foto, fotoLen)))
++                {
++                    Serial.println("[FLOW] fallo el press: backend OFF, sigo evaluando (el evento local sigue)");
++                    backend = Backend::OFF;
++                }
++                else
++                {
++                    Serial.printf("[FLOW] sesion de backend iniciada trackId=%s\n", trackId.c_str());
++                    backend = Backend::EN_SESION;
++
++                    // Negocia video+audio y prende de entrada lo que disparo la
++                    // conexion. Lo que falta lo prende loop() al detectarlo.
++                    BackendSession::iniciarMedia();
++                    BackendSession::activarAudio(audioDetectado);
++                    BackendSession::activarVideo(videoDetectado);
++                }
++            }
++            else if (millis() - conectandoDesde > Config::Event::BACKEND_CONNECT_TIMEOUT_MS)
++            {
++                Serial.println("[FLOW] timeout conectando backend: backend OFF, sigo evaluando (sigue el local)");
++                backend = Backend::OFF;
++            }
++        }
+ 
+         if (hangupPedido)
+         {
+diff --git a/timbre/lib/MqttClient/MqttClient.cpp b/timbre/lib/MqttClient/MqttClient.cpp
+index 2a32eb9..0449432 100644
+--- a/timbre/lib/MqttClient/MqttClient.cpp
++++ b/timbre/lib/MqttClient/MqttClient.cpp
+@@ -1,18 +1,20 @@
+ #include "MqttClient.h"
+ 
+ #include <WiFi.h>
+-#include <WiFiClient.h>
++#include <WiFiClientSecure.h>
+ #include <MQTT.h>        // 256dpi/arduino-mqtt
+-#include <ArduinoJson.h> // bblanchon/ArduinoJson (ya es dep del proyecto)
++#include <ArduinoJson.h> // bblanchon/ArduinoJson
+ #include <time.h>
+ 
++#include "Certs.h"  // CA_CERT, DEVICE_CERT, DEVICE_KEY (identidad mTLS)
++#include "Config.h" // Config::Mqtt::TLS_HOSTNAME
++
+ // ---------------------------------------------------------------------------
+-// Config por build flags (con defaults). Se pueden pisar desde platformio.ini
+-// igual que SEED_WIFI_*, sin tocar este archivo.
++// Config por build flags (con defaults). Se pueden pisar desde platformio.ini.
+ // ---------------------------------------------------------------------------
+ #ifndef MQTT_BUFFER_SIZE
+-// press/stream_end/capture son JSON chicos (<1KB). Si algun dia se manda la
+-// imagen base64 en el press, subir esto (una QVGA base64 ronda 15-35 KB).
++// press/stream_end son JSON chicos (<1KB). Con la imagen base64 en el press
++// hace falta mas (una QVGA base64 ronda 15-35 KB).
+ #define MQTT_BUFFER_SIZE 2048
+ #endif
+ 
+@@ -24,34 +26,38 @@
+ #define MQTT_RECONNECT_INTERVAL_MS 3000
+ #endif
+ 
+-// Timeout de la conexion TCP/CONNACK. Bajo, para que un broker caido no cuelgue
+-// el loop principal (que ademas atiende el stream local).
++// Timeout de CONNACK/SUBACK. Con TLS contra una VM en internet 2 s quedaba justo.
+ #ifndef MQTT_CONNECT_TIMEOUT_MS
+-#define MQTT_CONNECT_TIMEOUT_MS 2000
++#define MQTT_CONNECT_TIMEOUT_MS 5000
++#endif
++
++// Timeout del handshake TLS, en SEGUNDOS (WiFiClientSecure::setHandshakeTimeout).
++#ifndef MQTT_TLS_HANDSHAKE_TIMEOUT_S
++#define MQTT_TLS_HANDSHAKE_TIMEOUT_S 10
+ #endif
+ 
+-// Cuantos intentos fallidos seguidos antes de abandonar el backend. Tras esto
+-// se deja de reintentar (para no trabar el stream local) hasta el proximo
+-// conectar() -- es decir, hasta el proximo timbre.
++// Cuantos intentos fallidos seguidos antes de abandonar el backend (para no
++// trabar el stream local). Se reintenta en el proximo conectar().
+ #ifndef MQTT_MAX_CONNECT_ATTEMPTS
+ #define MQTT_MAX_CONNECT_ATTEMPTS 2
+ #endif
+ 
+ namespace
+ {
+-    const char *TOPIC_PRESS = "home/doorbell/events/press";
+-    const char *TOPIC_STREAM_END = "home/doorbell/events/stream_end";
+-    const char *TOPIC_CAPTURE_IMAGE = "home/doorbell/events/capture_image";
+-    const char *TOPIC_CAPTURE_AUDIO = "home/doorbell/events/capture_audio";
+-    const char *TOPIC_IA_RESPONSE = "home/doorbell/events/ia_response";
++    const char *ACTION_PRESS = "press";
++    const char *ACTION_STREAM_END = "stream_end";
++    const char *ACTION_CAPTURE_IMAGE = "capture_image";
++    const char *ACTION_CAPTURE_AUDIO = "capture_audio";
++    const char *ACTION_IA_RESPONSE = "ia_response";
+ 
+-    WiFiClient net;
++    WiFiClientSecure net;
+     MQTTClient mqtt(MQTT_BUFFER_SIZE);
+ 
+     String brokerHost;
+-    uint16_t brokerPort = 1883;
++    uint16_t brokerPort = 8883;
+     String deviceId;
+     String clientId;
++    String topicIaResponse; // home/{deviceId}/events/+/ia_response
+ 
+     MqttClient::IaResponseHandler iaHandler = nullptr;
+ 
+@@ -61,19 +67,63 @@ namespace
+     unsigned long lastConnectAttempt = 0;
+     int connectAttempts = 0; // fallos seguidos; al llegar al max, abandona
+ 
+-    // Epoch en milisegundos UTC, o 0 si el reloj todavia no esta sincronizado
+-    // por NTP (WifiManager::connect hace la sincro).
++    // Ultimos messageId vistos, para descartar reentregas QoS 1.
++    constexpr size_t SEEN_IDS = 8;
++    String seenIds[SEEN_IDS];
++    size_t seenNext = 0;
++
++    bool yaVisto(const String &messageId)
++    {
++        if (messageId.length() == 0)
++            return false;
++        for (size_t i = 0; i < SEEN_IDS; i++)
++        {
++            if (seenIds[i] == messageId)
++                return true;
++        }
++        seenIds[seenNext] = messageId;
++        seenNext = (seenNext + 1) % SEEN_IDS;
++        return false;
++    }
++
++    // home/{deviceId}/events/{trackId}/{action}
++    String topicFor(const String &trackId, const char *action)
++    {
++        return "home/" + deviceId + "/events/" + trackId + "/" + action;
++    }
++
++    // Parsea home/{deviceId}/events/{trackId}/{action}. Devuelve false si el
++    // topico no tiene esa forma o no es de este device.
++    bool parseTopic(const String &topic, String &trackId, String &action)
++    {
++        String prefix = "home/" + deviceId + "/events/";
++        if (!topic.startsWith(prefix))
++            return false;
++        int slash = topic.indexOf('/', prefix.length());
++        if (slash < 0)
++            return false;
++        trackId = topic.substring(prefix.length(), slash);
++        action = topic.substring(slash + 1);
++        return trackId.length() > 0 && action.length() > 0 && action.indexOf('/') < 0;
++    }
++
++    // Epoch en milisegundos UTC, o 0 si el reloj todavia no esta sincronizado.
+     int64_t nowEpochMillis()
+     {
+         time_t now = time(nullptr);
+         if (now < 1600000000L) // ~2020-09; antes de eso el reloj no arranco
+-        {
+             return 0;
+-        }
+         return static_cast<int64_t>(now) * 1000LL;
+     }
+ 
+-    void handleIaResponse(const String &payload)
++    void addTimestamp(JsonDocument &doc)
++    {
++        int64_t ts = nowEpochMillis();
++        if (ts > 0)
++            doc["timestamp"] = ts;
++    }
++
++    void handleIaResponse(const String &trackId, const String &payload)
+     {
+         JsonDocument doc;
+         DeserializationError err = deserializeJson(doc, payload);
+@@ -84,43 +134,46 @@ namespace
+         }
+ 
+         MqttClient::IaResponse r;
+-        r.trackId = doc["trackId"] | "";
+-        r.deviceId = doc["deviceId"] | "";
++        r.trackId = trackId;
++        r.messageId = doc["messageId"] | "";
+         r.chunkType = doc["chunkType"] | "";
+         r.action = doc["action"] | "";
+         r.severity = doc["severity"] | "";
+         r.message = doc["message"] | "";
+ 
+-        // Filtrado por deviceId: ignorar instrucciones de otros timbres.
+-        if (r.deviceId.length() > 0 && r.deviceId != deviceId)
++        if (yaVisto(r.messageId))
+         {
++            Serial.printf("[MQTT] ia_response duplicado (messageId=%s), ignorado\n",
++                          r.messageId.c_str());
+             return;
+         }
+ 
+-        Serial.printf("[MQTT] ia_response track=%s chunk=%s action=%s sev=%s\n",
++        Serial.printf("[MQTT] <- ia_response track=%s chunk=%s action=%s sev=%s\n",
+                       r.trackId.c_str(), r.chunkType.c_str(),
+                       r.action.c_str(), r.severity.c_str());
+ 
+         if (iaHandler)
+-        {
+             iaHandler(r);
+-        }
+     }
+ 
+     // Callback de arduino-mqtt (firma simple: topic + payload).
+     void onMessage(String &topic, String &payload)
+     {
+-        if (topic == TOPIC_IA_RESPONSE)
++        String trackId, action;
++        if (!parseTopic(topic, trackId, action))
+         {
+-            handleIaResponse(payload);
++            Serial.printf("[MQTT] topico inesperado: %s\n", topic.c_str());
++            return;
+         }
++        if (action == ACTION_IA_RESPONSE)
++            handleIaResponse(trackId, payload);
+     }
+ 
+-    bool publishJson(const char *topic, JsonDocument &doc)
++    bool publishJson(const String &topic, JsonDocument &doc)
+     {
+         if (!mqtt.connected())
+         {
+-            Serial.printf("[MQTT] publish a %s descartado: sin conexion\n", topic);
++            Serial.printf("[MQTT] publish a %s descartado: sin conexion\n", topic.c_str());
+             return false;
+         }
+ 
+@@ -132,46 +185,76 @@ namespace
+         if (!ok)
+         {
+             Serial.printf("[MQTT] publish a %s fallo (err=%d)\n",
+-                          topic, mqtt.lastError());
++                          topic.c_str(), mqtt.lastError());
+         }
+         return ok;
+     }
+ 
++    void onConnectFailed()
++    {
++        net.stop();
++        connectAttempts++;
++        if (connectAttempts >= MQTT_MAX_CONNECT_ATTEMPTS)
++        {
++            // Broker inalcanzable: dejamos de reintentar para no trabar el
++            // stream local. Se reintenta en el proximo conectar() (timbre).
++            enabled = false;
++            Serial.println("[MQTT] broker inalcanzable, abandono el backend "
++                           "(el stream local sigue)");
++        }
++    }
++
+     void connectNow()
+     {
+         if (WiFi.status() != WL_CONNECTED)
+-        {
+             return; // sin WiFi no hay nada que hacer
+-        }
+ 
+         lastConnectAttempt = millis();
+-        Serial.printf("[MQTT] conectando a %s:%u como %s... (intento %d/%d)\n",
+-                      brokerHost.c_str(), brokerPort, clientId.c_str(),
+-                      connectAttempts + 1, MQTT_MAX_CONNECT_ATTEMPTS);
++        Serial.printf("[MQTT] conectando a mqtts://%s:%u (tls-name=%s) como %s... (intento %d/%d)\n",
++                      brokerHost.c_str(), brokerPort, Config::Mqtt::TLS_HOSTNAME,
++                      clientId.c_str(), connectAttempts + 1, MQTT_MAX_CONNECT_ATTEMPTS);
+ 
+-        // Lab: broker plano sin auth. Para user/pass usar connect(id, user, pass).
+-        if (mqtt.connect(clientId.c_str()))
++        IPAddress ip;
++        if (!WiFi.hostByName(brokerHost.c_str(), ip))
+         {
+-            connectAttempts = 0;
+-            Serial.println("[MQTT] conectado");
+-            subscribed = mqtt.subscribe(TOPIC_IA_RESPONSE, 1);
+-            Serial.printf("[MQTT] suscripto a %s (QoS 1)\n", TOPIC_IA_RESPONSE);
++            Serial.printf("[MQTT] no se pudo resolver %s\n", brokerHost.c_str());
++            onConnectFailed();
++            return;
+         }
+-        else
++
++        // 1) TCP + handshake mTLS a mano. Se conecta a la IP pero se valida el
++        //    server cert contra TLS_HOSTNAME (ver Config.h).
++        net.stop();
++        if (!net.connect(ip, brokerPort, Config::Mqtt::TLS_HOSTNAME,
++                         CA_CERT, DEVICE_CERT, DEVICE_KEY))
+         {
+-            connectAttempts++;
+-            Serial.printf("[MQTT] conexion fallo (err=%d, ret=%d)\n",
+-                        mqtt.lastError(), mqtt.returnCode());
+-
+-            if (connectAttempts >= MQTT_MAX_CONNECT_ATTEMPTS)
+-            {
+-                // Broker inalcanzable: dejamos de reintentar para no trabar el
+-                // stream local. Se reintenta en el proximo conectar() (timbre).
+-                enabled = false;
+-                Serial.println("[MQTT] broker inalcanzable, abandono el backend "
+-                            "(el stream local sigue)");
+-            }
++            char err[128] = {0};
++            int code = net.lastError(err, sizeof(err));
++            Serial.printf("[MQTT] handshake TLS fallo (%d): %s\n", code, err);
++            onConnectFailed();
++            return;
+         }
++
++        // 2) CONNECT MQTT sobre el socket ya abierto (skip=true: no reconecta).
++        if (!mqtt.connect(clientId.c_str(), true))
++        {
++            // returnCode 5 = not authorized (CN rechazado por el broker).
++            Serial.printf("[MQTT] CONNECT fallo (err=%d, ret=%d)\n",
++                          mqtt.lastError(), mqtt.returnCode());
++            onConnectFailed();
++            return;
++        }
++
++        connectAttempts = 0;
++        Serial.println("[MQTT] conectado (mTLS)");
++
++        subscribed = mqtt.subscribe(topicIaResponse, 1);
++        if (subscribed)
++            Serial.printf("[MQTT] suscripto a %s (QoS 1)\n", topicIaResponse.c_str());
++        else
++            Serial.printf("[MQTT] suscripcion a %s RECHAZADA (err=%d). "
++                          "Revisar ACL / CN del cert\n",
++                          topicIaResponse.c_str(), mqtt.lastError());
+     }
+ }
+ 
+@@ -183,14 +266,14 @@ namespace MqttClient
+         brokerPort = port;
+         deviceId = id;
+         clientId = "timbre-" + id; // unico por dispositivo; nunca "gateway-micro"
++        topicIaResponse = "home/" + deviceId + "/events/+/" + ACTION_IA_RESPONSE;
++
++        net.setHandshakeTimeout(MQTT_TLS_HANDSHAKE_TIMEOUT_S);
+ 
+-        // Timeout de la conexion TCP: si el broker no responde, no queremos que
+-        // WiFiClient::connect() cuelgue el loop por varios segundos.
+-        
++        // begin() guarda host/puerto, pero la conexion de red la hacemos a mano
++        // en connectNow() (mqtt.connect(..., skip=true)).
+         mqtt.begin(brokerHost.c_str(), brokerPort, net);
+-        mqtt.setKeepAlive(MQTT_KEEPALIVE_SECONDS);
+         // cleanSession=true: no queremos cola persistente del lado del broker.
+-        // El 3er parametro es el timeout de comandos/CONNACK (antes 5000).
+         mqtt.setOptions(MQTT_KEEPALIVE_SECONDS, true, MQTT_CONNECT_TIMEOUT_MS);
+         mqtt.onMessage(onMessage);
+ 
+@@ -206,16 +289,12 @@ namespace MqttClient
+     void loop()
+     {
+         if (!started)
+-        {
+             return;
+-        }
+ 
+         mqtt.loop();
+ 
+         if (!mqtt.connected())
+-        {
+             subscribed = false; // si se cayo, ya no estamos suscriptos
+-        }
+ 
+         if (enabled && !mqtt.connected() &&
+             (millis() - lastConnectAttempt) > MQTT_RECONNECT_INTERVAL_MS)
+@@ -235,7 +314,8 @@ namespace MqttClient
+             return;
+         enabled = true;
+         connectAttempts = 0; // cada evento arranca con los intentos frescos
+-        connectNow();        // dispara el intento; el resultado se resuelve en loop()
++        if (!mqtt.connected())
++            connectNow();
+     }
+ 
+     void desconectar()
+@@ -244,101 +324,53 @@ namespace MqttClient
+         connectAttempts = 0;
+         subscribed = false;
+         if (mqtt.connected())
+-        {
+             mqtt.disconnect();
+-        }
++        net.stop();
+     }
+ 
+     bool listo()
+     {
+-        // Listo para publicar/recibir: conectado Y suscripto a ia_response.
+         return enabled && mqtt.connected() && subscribed;
+     }
+ 
+-    bool publishPress(
+-        const String &eventId,
+-        const String &rtspUrl,
+-        const String &imageBase64,
+-        float batteryPercentage)
++    bool publishPress(const String &trackId,
++                      const String &imageBase64,
++                      float batteryPercentage)
+     {
+         JsonDocument doc;
+-        doc["eventId"] = eventId; // == trackId de la sesion
+-        doc["deviceId"] = deviceId;
+         doc["event"] = "press";
+-        doc["rtspUrl"] = rtspUrl;
+-
+-        int64_t ts = nowEpochMillis();
+-        if (ts > 0)
+-        {
+-            doc["timestamp"] = ts;
+-        }
++        addTimestamp(doc);
+         if (imageBase64.length() > 0)
+-        {
+             doc["image"] = imageBase64;
+-        }
+         if (!isnan(batteryPercentage))
+-        {
+             doc["batteryPercentage"] = batteryPercentage;
+-        }
+ 
+-        Serial.printf("[MQTT] -> press eventId=%s rtsp=%s\n",
+-                      eventId.c_str(), rtspUrl.c_str());
+-        return publishJson(TOPIC_PRESS, doc);
++        String topic = topicFor(trackId, ACTION_PRESS);
++        Serial.printf("[MQTT] -> %s (imagen %u chars)\n",
++                      topic.c_str(), (unsigned)imageBase64.length());
++        return publishJson(topic, doc);
+     }
+ 
+     bool publishStreamEnd(const String &trackId)
+     {
+         JsonDocument doc;
+-        doc["trackId"] = trackId;
+-        doc["deviceId"] = deviceId;
+-
+-        int64_t ts = nowEpochMillis();
+-        if (ts > 0)
+-        {
+-            doc["timestamp"] = ts;
+-        }
+-
+-        Serial.printf("[MQTT] -> stream_end trackId=%s\n", trackId.c_str());
+-        return publishJson(TOPIC_STREAM_END, doc);
++        addTimestamp(doc);
++        String topic = topicFor(trackId, ACTION_STREAM_END);
++        Serial.printf("[MQTT] -> %s\n", topic.c_str());
++        return publishJson(topic, doc);
+     }
+ 
+-    bool publishCaptureImage(const String &trackId, const String &rtspUrl)
++    bool publishCaptureImage(const String &trackId)
+     {
+         JsonDocument doc;
+-        doc["deviceId"] = deviceId;
+-        if (trackId.length() > 0)
+-        {
+-            doc["trackId"] = trackId;
+-        }
+-        if (rtspUrl.length() > 0)
+-        {
+-            doc["rtspUrl"] = rtspUrl;
+-        }
+-        int64_t ts = nowEpochMillis();
+-        if (ts > 0)
+-        {
+-            doc["timestamp"] = ts;
+-        }
+-        return publishJson(TOPIC_CAPTURE_IMAGE, doc);
++        addTimestamp(doc);
++        return publishJson(topicFor(trackId, ACTION_CAPTURE_IMAGE), doc);
+     }
+ 
+-    bool publishCaptureAudio(const String &trackId, const String &rtspUrl)
++    bool publishCaptureAudio(const String &trackId)
+     {
+         JsonDocument doc;
+-        doc["deviceId"] = deviceId;
+-        if (trackId.length() > 0)
+-        {
+-            doc["trackId"] = trackId;
+-        }
+-        if (rtspUrl.length() > 0)
+-        {
+-            doc["rtspUrl"] = rtspUrl;
+-        }
+-        int64_t ts = nowEpochMillis();
+-        if (ts > 0)
+-        {
+-            doc["timestamp"] = ts;
+-        }
+-        return publishJson(TOPIC_CAPTURE_AUDIO, doc);
++        addTimestamp(doc);
++        return publishJson(topicFor(trackId, ACTION_CAPTURE_AUDIO), doc);
+     }
+ }
+diff --git a/timbre/lib/MqttClient/MqttClient.h b/timbre/lib/MqttClient/MqttClient.h
+index 5b1c252..65080c4 100644
+--- a/timbre/lib/MqttClient/MqttClient.h
++++ b/timbre/lib/MqttClient/MqttClient.h
+@@ -3,87 +3,39 @@
+ 
+ // ---------------------------------------------------------------------------
+ // MqttClient: plano de control del timbre contra el gateway-microcontroller.
++// Contrato: gateway-microcontroller/docs/contrato-esp32.md
+ //
+-// Publica (el gateway escucha):
+-//   - home/doorbell/events/press          (inicio de llamada)          QoS 1
+-//   - home/doorbell/events/stream_end     (cierre de sesion)           QoS 1
+-//   - home/doorbell/events/capture_image  (captura on-demand, opc.)    QoS 1
+-//   - home/doorbell/events/capture_audio  (captura on-demand, opc.)    QoS 1
++// Transporte: MQTTS con mTLS (Mosquitto, profile "secure", puerto 8883).
++//   - El timbre presenta DEVICE_CERT/DEVICE_KEY (lib/Certs). Mosquitto usa el
++//     CN del cert como username (use_identity_as_username) y el ACL solo deja
++//     tocar home/<CN>/#. Por eso deviceId == CN (ver Device::certMatchesDeviceId).
++//   - El server cert se valida contra CA_CERT y contra el nombre
++//     Config::Mqtt::TLS_HOSTNAME (ver Config.h: por que no la IP).
+ //
+-// Se suscribe (el gateway publica):
+-//   - home/doorbell/events/ia_response    (instruccion post-analisis)  QoS 1
++// Topicos (la identidad va SOLO en el topico, nunca en el JSON):
++//   Publica (QoS 1, sin retain):
++//     home/{deviceId}/events/{trackId}/press
++//     home/{deviceId}/events/{trackId}/stream_end
++//     home/{deviceId}/events/{trackId}/capture_image   (opcional)
++//     home/{deviceId}/events/{trackId}/capture_audio   (opcional)
++//   Se suscribe (QoS 1):
++//     home/{deviceId}/events/+/ia_response
++//     (wildcard SOLO en el trackId de este device; el trackId se saca del
++//      topico y BackendSession filtra por la sesion activa)
+ //
+-// Reglas del contrato que respeta este modulo:
+-//   - QoS 1 y sin retain en todo.
+-//   - deviceId estable (Device::getDeviceId), eventId nuevo por llamada.
+-//   - eventId del press == trackId de toda la sesion; vuelve en ia_response y va
+-//     en stream_end.
+-//   - El JSON es UTF-8 valido (ArduinoJson). No se manda media binaria por MQTT.
++// Payloads (JSON compacto UTF-8):
++//   press:       {"event":"press","timestamp":<ms>,"image":"<b64>","batteryPercentage":<f>}
++//                timestamp/image/batteryPercentage son opcionales.
++//   stream_end:  {"timestamp":<ms>}
++//   capture_*:   {"timestamp":<ms>}
++//   ia_response (entrada):
++//                {"messageId":"<uuid>","chunkType":"IMAGE|VIDEO|AUDIO",
++//                 "action":"CONTINUE|STOP_DANGER","severity":"...","message":"..."}
++//                Un messageId repetido es reentrega QoS 1: se descarta.
+ //
+-// El broker en el lab es plano (tcp://host:1883, sin TLS ni auth). El mTLS del
+-// proyecto es solo para el ApiClient HTTPS, no para MQTT.
+-//
+-// ===========================================================================
+-// PAYLOADS EXACTOS (lo que sale del cable, tal cual lo arma este modulo)
+-// ===========================================================================
+-// Todos los payloads son un unico objeto JSON UTF-8, sin espacios ni saltos
+-// (serializeJson compacto), publicado con QoS 1 y retain=false.
+-//
+-// Campos comunes:
+-//   deviceId   string  - Device::getDeviceId(). Siempre presente.
+-//   timestamp  int64   - epoch en MILISEGUNDOS UTC. SE OMITE si el reloj no
+-//                        esta sincronizado por NTP (time(nullptr) < 2020-09).
+-//                        O sea: el gateway no puede asumir que exista.
+-//
+-// --- home/doorbell/events/press --------------------------------------------
+-// Lo publica publishPress(). Campos:
+-//   eventId            string  - id de esta llamada; ES el trackId de la sesion.
+-//   deviceId           string
+-//   event              string  - literal constante "press".
+-//   rtspUrl            string  - siempre presente (puede venir vacio si el
+-//                                llamador pasa ""); no se valida aca.
+-//   timestamp          int64   - opcional (ver arriba).
+-//   image              string  - opcional; JPEG en Base64 SIN prefijo data:.
+-//                                Solo si imageBase64 != "". Ojo MQTT_BUFFER_SIZE.
+-//   batteryPercentage  float   - opcional; solo si no es NAN.
+-//
+-// {"eventId":"evt-7f3a","deviceId":"esp32-a1b2c3","event":"press",
+-//  "rtspUrl":"rtsp://192.168.0.42:8554/timbre","timestamp":1756512000000,
+-//  "batteryPercentage":87.5}
+-//
+-// --- home/doorbell/events/stream_end ---------------------------------------
+-// Lo publica publishStreamEnd(). Campos:
+-//   trackId    string  - == eventId del press de esta sesion.
+-//   deviceId   string
+-//   timestamp  int64   - opcional.
+-// NO lleva "event" ni "rtspUrl".
+-//
+-// {"trackId":"evt-7f3a","deviceId":"esp32-a1b2c3","timestamp":1756512045000}
+-//
+-// --- home/doorbell/events/capture_image ------------------------------------
+-// --- home/doorbell/events/capture_audio ------------------------------------
+-// Los publican publishCaptureImage() / publishCaptureAudio(). Mismo shape los
+-// dos, cambia solo el topic. Campos:
+-//   deviceId   string  - unico obligatorio.
+-//   trackId    string  - opcional; solo si se paso != "".
+-//   rtspUrl    string  - opcional; solo si se paso != "".
+-//   timestamp  int64   - opcional.
+-// NO llevan "event". El payload minimo posible es {"deviceId":"..."}.
+-//
+-// {"deviceId":"esp32-a1b2c3","trackId":"evt-7f3a",
+-//  "rtspUrl":"rtsp://192.168.0.42:8554/timbre","timestamp":1756512010000}
+-//
+-// --- home/doorbell/events/ia_response (ENTRADA, no lo publicamos) ----------
+-// Se espera un objeto con: trackId, deviceId, chunkType, action, severity,
+-// message (todos string). Los que falten quedan como "" en IaResponse. Si el
+-// deviceId viene y no es el nuestro, el mensaje se descarta sin llamar al
+-// handler.
+-//
+-// {"trackId":"evt-7f3a","deviceId":"esp32-a1b2c3","chunkType":"IMAGE",
+-//  "action":"CONTINUE","severity":"NORMAL","message":"Persona conocida"}
+-//
+-// Nota: si no hay conexion al broker, el publish se descarta (se loguea y
+-// devuelve false); no hay cola local ni reintento del mensaje.
++// timestamp = epoch ms UTC; se omite si el reloj no esta sincronizado (NTP).
++// Si no hay conexion al broker, el publish se descarta (se loguea y devuelve
++// false); no hay cola local ni reintento del mensaje.
+ // ---------------------------------------------------------------------------
+ 
+ namespace MqttClient
+@@ -91,26 +43,24 @@ namespace MqttClient
+     // Instruccion recibida del gateway (ia_response ya parseada).
+     struct IaResponse
+     {
+-        String trackId;   // == eventId del press de esta sesion
+-        String deviceId;  // el de este dispositivo
++        String trackId;   // sacado del topico (== eventId del press)
++        String messageId; // unico por publicacion del gateway
+         String chunkType; // "IMAGE" | "VIDEO" | "AUDIO"
+         String action;    // "CONTINUE" | "STOP_DANGER"
+-        String severity;  // "NORMAL" | "LOW" | "MEDIUM" | "HIGH"
++        String severity;  // finalSeverity del orquestador (p. ej. "PELIGROSO")
+         String message;   // texto para UI / log / TTS
+ 
+         bool isStopDanger() const { return action == "STOP_DANGER"; }
+         bool isContinue() const { return action == "CONTINUE"; }
+     };
+ 
+-    // Callback que se invoca por cada ia_response cuyo deviceId coincide con el
+-    // nuestro. El filtrado por trackId (llamadas solapadas) lo hace el llamador.
++    // Callback por cada ia_response de ESTE device. El filtrado por trackId
++    // (sesion activa) lo hace el llamador.
+     typedef void (*IaResponseHandler)(const IaResponse &response);
+ 
+-    // Configura el cliente. deviceId se usa para filtrar ia_response y para
+-    // derivar un clientId unico ("timbre-<deviceId>"). No conecta todavia:
+-    // la conexion se maneja de forma perezosa en loop().
+-    //   host: IP/hostname del broker alcanzable por el ESP32 y el gateway.
+-    //   port: 1883 tipico.
++    // Configura el cliente. deviceId arma los topicos y el clientId
++    // ("timbre-<deviceId>"). No conecta todavia: eso lo dispara conectar().
++    //   host: IP o hostname del broker. port: 8883 (MQTTS).
+     void initialize(const String &host, uint16_t port, const String &deviceId);
+ 
+     // Registra el handler de ia_response. Opcional.
+@@ -120,16 +70,15 @@ namespace MqttClient
+     // mensajes entrantes. Llamar en cada vuelta del loop() principal.
+     void loop();
+ 
+-    // true si hay sesion MQTT activa con el broker (TCP+CONNECT).
++    // true si hay sesion MQTT activa con el broker (TLS+CONNECT).
+     bool connected();
+ 
+-    // Dispara la conexion al broker (no bloquea). El resultado se resuelve en
+-    // loop(). Antes de esto, initialize() solo configura pero no conecta.
++    // Dispara la conexion al broker. OJO: el handshake TLS es bloqueante
++    // (~1-3 s con RSA 2048); el stream local corre en el otro core.
+     void conectar();
+ 
+-    // Deja de reintentar y cierra la conexion si estaba abierta. Se vuelve a
+-    // intentar con el proximo conectar(). Tambien se auto-invoca internamente
+-    // tras MQTT_MAX_CONNECT_ATTEMPTS fallos, para no trabar el stream local.
++    // Deja de reintentar y cierra la conexion si estaba abierta. Tambien se
++    // auto-invoca tras MQTT_MAX_CONNECT_ATTEMPTS fallos seguidos.
+     void desconectar();
+ 
+     // true cuando esta LISTO para publicar/recibir: conectado Y suscripto a
+@@ -138,24 +87,19 @@ namespace MqttClient
+ 
+     // --- Publicaciones (todas QoS 1, sin retain) ---------------------------
+ 
+-    // press: inicio de llamada. El eventId ES el trackId de la sesion.
+-    //   rtspUrl: URL que el gateway puede reproducir (rtsp:// o rtsps://). No
+-    //            puede ser 127.0.0.1 si el gateway corre en otro host.
+-    //   imageBase64: JPEG en Base64. Opcional; si se omite el gateway saca un
+-    //                frame por RTSP. Recomendado dejarlo vacio para no inflar
+-    //                el payload (y subir el buffer si se decide mandarlo).
++    // press: inicio de llamada. trackId (== eventId) lo genera EventFlow.
++    //   imageBase64: JPEG en Base64 (opcional; si falta, el gateway saca un
++    //                frame por RTSP). Ojo MQTT_BUFFER_SIZE.
+     //   batteryPercentage: informativo; NAN para omitirlo.
+-    // Devuelve true si el publish salio (token OK). No confirma entrega end-to-end.
+-    bool publishPress(const String &eventId,
+-                      const String &rtspUrl,
++    // Devuelve true si el publish salio. No confirma entrega end-to-end.
++    bool publishPress(const String &trackId,
+                       const String &imageBase64 = "",
+                       float batteryPercentage = NAN);
+ 
+-    // stream_end: el ESP32 deja de publicar RTSP. trackId == eventId del press.
++    // stream_end: cierre de la llamada trackId.
+     bool publishStreamEnd(const String &trackId);
+ 
+-    // Captura on-demand (opcional, no es el flujo de timbre). Si hay sesion
+-    // activa se pueden omitir trackId y rtspUrl; si no, hacen falta ambos.
+-    bool publishCaptureImage(const String &trackId = "", const String &rtspUrl = "");
+-    bool publishCaptureAudio(const String &trackId = "", const String &rtspUrl = "");
++    // Captura on-demand (opcional, no es el flujo de timbre).
++    bool publishCaptureImage(const String &trackId);
++    bool publishCaptureAudio(const String &trackId);
+ }
+diff --git a/timbre/platformio.ini b/timbre/platformio.ini
+index 91ffebc..4ff607e 100644
+--- a/timbre/platformio.ini
++++ b/timbre/platformio.ini
+@@ -12,8 +12,14 @@ build_flags =
+     ; Identidad del timbre. Tiene que ser IGUAL al CN de lib/Certs/certs/device.pem
+     ; (Mosquitto usa el CN como username y el ACL solo permite home/<CN>/#).
+     -DDEVICE_ID='"f6d44bb5-7f59-4635-bc53-f7d7eb0c1f9f"'
+-    -DMQTT_BROKER_HOST='"192.168.1.69"'
+-    -DMQTT_BROKER_PORT=1883
++    ; MQTTS (mTLS) contra Mosquitto de la VM (profile secure de microcontroller-communication)
++    -DMQTT_BROKER_HOST='"34.27.42.246"'
++    -DMQTT_BROKER_PORT=8883
++    ; nombre con el que se valida el server cert (ver Config.h)
++    -DMQTT_TLS_HOSTNAME='"localhost"'
++    ; lab viejo (broker plano, ya no soportado por MqttClient):
++    ; -DMQTT_BROKER_HOST='"192.168.1.69"'
++    ; -DMQTT_BROKER_PORT=1883
+     ; -DMQTT_BROKER_HOST='"bore.pub"'
+     ; -DMQTT_BROKER_PORT=25076
+     ; -DMQTT_BROKER_HOST='"136.119.178.77"'

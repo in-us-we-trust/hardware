@@ -1,8 +1,15 @@
 #include "RtspPublisher.h"
 #include "Config.h"
+#include "Certs.h" // CA_CERT: valida el server cert de MediaMTX
 #include <WiFi.h>
-#include <WiFiClient.h>
+#include <WiFiClientSecure.h>
 #include <string.h>
+#include "mbedtls/base64.h"
+
+// Timeout del handshake TLS, en SEGUNDOS (WiFiClientSecure::setHandshakeTimeout).
+#ifndef RTSP_TLS_HANDSHAKE_TIMEOUT_S
+#define RTSP_TLS_HANDSHAKE_TIMEOUT_S 10
+#endif
 
 #define RTP_PT_JPEG 26 // video JPEG (RFC 2435)
 #define RTP_PT_PCMU 0  // audio G.711 u-law
@@ -16,7 +23,9 @@ namespace
 {
     using State = RtspPublisher::State;
 
-    WiFiClient tcp;
+    // RTSPS: TLS solo del lado del server (MediaMTX no pide client cert). La
+    // identidad va por user/pass (Basic) en cada request.
+    WiFiClientSecure tcp;
     MediaSource *videoSrc = nullptr;
     AudioSource *audioSrc = nullptr;
     // "has*" = track NEGOCIADO (declarado en el SDP; su fuente existe). Fijo
@@ -28,7 +37,8 @@ namespace
     bool audioActivo = false;
 
     String mtxHost;
-    String mtxPath = "doorbell";
+    String mtxPath;    // {deviceId}/doorbell/{trackId}; se fija en start()
+    String authHeader; // "Authorization: Basic ...\r\n" (precalculado)
 
     State st = State::Idle;
     uint32_t cseq = 1;
@@ -48,18 +58,37 @@ namespace
 
     uint8_t pkt[MAX_RTP_PACKET + 8];
 
+    // Sin credenciales en la URL: van en el header Authorization.
     String rtspUrl()
     {
-        return "rtsp://" + mtxHost + ":" + String(Config::Media::PORT) + "/" + mtxPath;
+        return "rtsps://" + mtxHost + ":" + String(Config::Media::PORT) + "/" + mtxPath;
+    }
+
+    String basicAuthHeader(const String &user, const String &pass)
+    {
+        String plain = user + ":" + pass;
+        size_t need = 0;
+        mbedtls_base64_encode(nullptr, 0, &need, (const uint8_t *)plain.c_str(), plain.length());
+        String out;
+        uint8_t *buf = (uint8_t *)malloc(need);
+        size_t written = 0;
+        if (buf && mbedtls_base64_encode(buf, need, &written,
+                                         (const uint8_t *)plain.c_str(), plain.length()) == 0)
+            out = "Authorization: Basic " + String((const char *)buf) + "\r\n";
+        free(buf);
+        return out;
     }
 
     // --- RTSP helpers -----------------------------------------------------
-    void sendRequest(const String &method, const String &extraHeaders,
+    // Todos los requests llevan Authorization (Basic preventivo): MediaMTX usa
+    // rtspAuthMethods [basic] por defecto y valida en cada request.
+    void sendRequest(const String &method, const String &url, const String &extraHeaders,
                      const String &body = "")
     {
-        String req = method + " " + rtspUrl() + " RTSP/1.0\r\n";
+        String req = method + " " + url + " RTSP/1.0\r\n";
         req += "CSeq: " + String(cseq++) + "\r\n";
         req += "User-Agent: timbre-esp32\r\n";
+        req += authHeader;
         if (sessionId.length() > 0)
             req += "Session: " + sessionId + "\r\n";
         req += extraHeaders;
@@ -90,6 +119,18 @@ namespace
     }
 
     bool responseOk(const String &resp) { return resp.startsWith("RTSP/1.0 200"); }
+
+    // Loguea la primera linea de una respuesta no-200 (401 = credenciales, 400
+    // = path/SDP, etc.) para no tener que adivinar.
+    void logBadResponse(const char *what, const String &resp)
+    {
+        int nl = resp.indexOf("\r\n");
+        String status = nl > 0 ? resp.substring(0, nl) : resp;
+        Serial.printf("[RTSP] %s respondio: %s\n", what, status.c_str());
+        if (resp.startsWith("RTSP/1.0 401"))
+            Serial.println("[RTSP] 401: user/pass rechazados o sin permiso de publish en ese path "
+                           "(ver authInternalUsers en mediamtx.secure.yml)");
+    }
 
     String extractSession(const String &resp)
     {
@@ -133,30 +174,18 @@ namespace
 
     // SETUP de cada track. Incluyen Session solo si ya lo tenemos (el primer
     // SETUP de la sesion todavia no lo tiene; el segundo si).
+    // RTP/AVP/TCP (no SAVP): con RTSPS + TCP interleaved el RTP ya viaja
+    // dentro del TLS; MediaMTX solo exige SAVP para UDP.
     void sendSetupVideo()
     {
-        String url = rtspUrl() + "/streamid=0";
-        String setup = "SETUP " + url + " RTSP/1.0\r\n";
-        setup += "CSeq: " + String(cseq++) + "\r\n";
-        if (sessionId.length() > 0)
-            setup += "Session: " + sessionId + "\r\n";
-        setup += "Transport: RTP/AVP/TCP;unicast;interleaved=0-1;mode=record\r\n";
-        setup += "\r\n";
-        tcp.print(setup);
-        Serial.println("[RTSP] -> SETUP video (interleaved 0-1)");
+        sendRequest("SETUP", rtspUrl() + "/streamid=0",
+                    "Transport: RTP/AVP/TCP;unicast;interleaved=0-1;mode=record\r\n");
     }
 
     void sendSetupAudio()
     {
-        String url = rtspUrl() + "/streamid=1";
-        String setup = "SETUP " + url + " RTSP/1.0\r\n";
-        setup += "CSeq: " + String(cseq++) + "\r\n";
-        if (sessionId.length() > 0)
-            setup += "Session: " + sessionId + "\r\n";
-        setup += "Transport: RTP/AVP/TCP;unicast;interleaved=2-3;mode=record\r\n";
-        setup += "\r\n";
-        tcp.print(setup);
-        Serial.println("[RTSP] -> SETUP audio (interleaved 2-3)");
+        sendRequest("SETUP", rtspUrl() + "/streamid=1",
+                    "Transport: RTP/AVP/TCP;unicast;interleaved=2-3;mode=record\r\n");
     }
 
     void fail(const char *why)
@@ -376,7 +405,11 @@ namespace
         aTimestamp += len; // cada byte u-law = 1 sample a 8kHz
 
         uint16_t rtpLen = (w - (pkt + 4));
-        sendInterleaved(RTP_CHAN_AUDIO, pkt, rtpLen);
+        if (!sendInterleaved(RTP_CHAN_AUDIO, pkt, rtpLen))
+        {
+            fail("write RTP audio fallo");
+            return;
+        }
 
         // Log cada ~50 chunks (~1s de audio) para confirmar que sale.
         static uint32_t audioCount = 0;
@@ -388,11 +421,12 @@ namespace
 
 namespace RtspPublisher
 {
-    void initialize(const String &mediaMtxHost, MediaSource *source,
-               AudioSource *audio, const String &path)
+    void initialize(const String &mediaMtxHost, const String &user, const String &pass,
+                    MediaSource *source, AudioSource *audio)
     {
         mtxHost = mediaMtxHost;
-        mtxPath = path;
+        mtxPath = "";
+        authHeader = basicAuthHeader(user, pass);
         videoSrc = source;
         audioSrc = audio;
         // hasVideo/hasAudio se deciden por evento en start(); aca solo guardamos
@@ -400,13 +434,16 @@ namespace RtspPublisher
         st = State::Idle;
         vSsrc = esp_random();
         aSsrc = esp_random();
-        Serial.printf("[RTSP] configurado -> %s (fuentes: video %s, audio %s)\n",
-                      rtspUrl().c_str(),
+        tcp.setHandshakeTimeout(RTSP_TLS_HANDSHAKE_TIMEOUT_S);
+        Serial.printf("[RTSP] configurado -> rtsps://%s:%d (user %s, tls-name %s, video %s, audio %s)\n",
+                      mtxHost.c_str(), Config::Media::PORT, user.c_str(),
+                      Config::Media::TLS_HOSTNAME,
                       videoSrc ? "si" : "no", audioSrc ? "si" : "no");
     }
 
-    bool start()
+    bool start(const String &path)
     {
+        mtxPath = path;
         // Negociamos todos los tracks con fuente disponible; el envio arranca
         // apagado y lo prende EventFlow cuando decide (deteccion).
         hasVideo = (videoSrc != nullptr);
@@ -420,12 +457,25 @@ namespace RtspPublisher
             return false;
         }
 
-        Serial.printf("[RTSP] conectando a %s:%d... (negociando video %s, audio %s)\n",
-                      mtxHost.c_str(), Config::Media::PORT,
-                      hasVideo ? "si" : "no", hasAudio ? "si" : "no");
-        if (!tcp.connect(mtxHost.c_str(), Config::Media::PORT))
+        Serial.printf("[RTSP] conectando a %s (negociando video %s, audio %s)...\n",
+                      rtspUrl().c_str(), hasVideo ? "si" : "no", hasAudio ? "si" : "no");
+
+        IPAddress ip;
+        if (!WiFi.hostByName(mtxHost.c_str(), ip))
         {
-            fail("no se pudo abrir TCP a MediaMTX");
+            fail("no se pudo resolver el host de MediaMTX");
+            return false;
+        }
+        // Handshake TLS (bloqueante, ~1-3 s). Se conecta a la IP pero valida el
+        // server cert contra TLS_HOSTNAME (mismo problema de SAN IP que MQTT).
+        tcp.stop();
+        if (!tcp.connect(ip, Config::Media::PORT, Config::Media::TLS_HOSTNAME,
+                         CA_CERT, nullptr, nullptr))
+        {
+            char err[128] = {0};
+            int code = tcp.lastError(err, sizeof(err));
+            Serial.printf("[RTSP] handshake TLS fallo (%d): %s\n", code, err);
+            fail("no se pudo abrir RTSPS a MediaMTX");
             return false;
         }
 
@@ -433,7 +483,7 @@ namespace RtspPublisher
         sessionId = "";
         frameCount = 0;
         st = State::Announcing;
-        sendRequest("ANNOUNCE", "Content-Type: application/sdp\r\n", buildSdp());
+        sendRequest("ANNOUNCE", rtspUrl(), "Content-Type: application/sdp\r\n", buildSdp());
         return true;
     }
 
@@ -442,7 +492,7 @@ namespace RtspPublisher
         if (st == State::Idle)
             return;
         if (tcp.connected())
-            sendRequest("TEARDOWN", "");
+            sendRequest("TEARDOWN", rtspUrl(), "");
         tcp.stop();
         st = State::Idle;
         Serial.println("[RTSP] detenido (TEARDOWN)");
@@ -493,6 +543,7 @@ namespace RtspPublisher
             String resp = readResponse();
             if (!responseOk(resp))
             {
+                logBadResponse("ANNOUNCE", resp);
                 fail("ANNOUNCE no-200");
                 return;
             }
@@ -517,6 +568,7 @@ namespace RtspPublisher
             String resp = readResponse();
             if (!responseOk(resp))
             {
+                logBadResponse("SETUP video", resp);
                 fail("SETUP video no-200");
                 return;
             }
@@ -534,7 +586,7 @@ namespace RtspPublisher
             {
                 // Solo video: directo a RECORD
                 st = State::Recording;
-                sendRequest("RECORD", "Range: npt=0.000-\r\n");
+                sendRequest("RECORD", rtspUrl(), "Range: npt=0.000-\r\n");
             }
             break;
         }
@@ -545,6 +597,7 @@ namespace RtspPublisher
             String resp = readResponse();
             if (!responseOk(resp))
             {
+                logBadResponse("SETUP audio", resp);
                 fail("SETUP audio no-200");
                 return;
             }
@@ -556,7 +609,7 @@ namespace RtspPublisher
                 sessionId = sid;
 
             st = State::Recording;
-            sendRequest("RECORD", "Range: npt=0.000-\r\n");
+            sendRequest("RECORD", rtspUrl(), "Range: npt=0.000-\r\n");
             break;
         }
         case State::Recording:
@@ -566,6 +619,7 @@ namespace RtspPublisher
             String resp = readResponse();
             if (!responseOk(resp))
             {
+                logBadResponse("RECORD", resp);
                 fail("RECORD no-200");
                 return;
             }
@@ -584,6 +638,14 @@ namespace RtspPublisher
             {
                 fail("TCP caido durante Publishing");
                 return;
+            }
+
+            // MediaMTX manda RTCP (receiver reports) por el mismo socket. No lo
+            // usamos, pero hay que leerlo para que no se llene el buffer.
+            {
+                uint8_t sink[128];
+                while (tcp.available())
+                    tcp.read(sink, sizeof(sink));
             }
 
             // Video: a la cadencia del source. Solo si el track fue negociado

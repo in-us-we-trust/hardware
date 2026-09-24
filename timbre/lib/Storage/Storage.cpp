@@ -8,21 +8,6 @@ namespace
 
 namespace Storage
 {
-    String loadDeviceId()
-    {
-        prefs.begin("device", true);
-        String id = prefs.getString("uuid", "");
-        prefs.end();
-        return id;
-    }
-
-    void saveDeviceId(const String &id)
-    {
-        prefs.begin("device", false);
-        prefs.putString("uuid", id);
-        prefs.end();
-    }
-
     bool loadDeviceRegistered()
     {
         prefs.begin("device", true);

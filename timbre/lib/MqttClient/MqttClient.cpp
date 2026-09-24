@@ -1,18 +1,20 @@
 #include "MqttClient.h"
 
 #include <WiFi.h>
-#include <WiFiClient.h>
+#include <WiFiClientSecure.h>
 #include <MQTT.h>        // 256dpi/arduino-mqtt
-#include <ArduinoJson.h> // bblanchon/ArduinoJson (ya es dep del proyecto)
+#include <ArduinoJson.h> // bblanchon/ArduinoJson
 #include <time.h>
 
+#include "Certs.h"  // CA_CERT, DEVICE_CERT, DEVICE_KEY (identidad mTLS)
+#include "Config.h" // Config::Mqtt::TLS_HOSTNAME
+
 // ---------------------------------------------------------------------------
-// Config por build flags (con defaults). Se pueden pisar desde platformio.ini
-// igual que SEED_WIFI_*, sin tocar este archivo.
+// Config por build flags (con defaults). Se pueden pisar desde platformio.ini.
 // ---------------------------------------------------------------------------
 #ifndef MQTT_BUFFER_SIZE
-// press/stream_end/capture son JSON chicos (<1KB). Si algun dia se manda la
-// imagen base64 en el press, subir esto (una QVGA base64 ronda 15-35 KB).
+// press/stream_end son JSON chicos (<1KB). Con la imagen base64 en el press
+// hace falta mas (una QVGA base64 ronda 15-35 KB).
 #define MQTT_BUFFER_SIZE 2048
 #endif
 
@@ -24,34 +26,38 @@
 #define MQTT_RECONNECT_INTERVAL_MS 3000
 #endif
 
-// Timeout de la conexion TCP/CONNACK. Bajo, para que un broker caido no cuelgue
-// el loop principal (que ademas atiende el stream local).
+// Timeout de CONNACK/SUBACK. Con TLS contra una VM en internet 2 s quedaba justo.
 #ifndef MQTT_CONNECT_TIMEOUT_MS
-#define MQTT_CONNECT_TIMEOUT_MS 2000
+#define MQTT_CONNECT_TIMEOUT_MS 5000
 #endif
 
-// Cuantos intentos fallidos seguidos antes de abandonar el backend. Tras esto
-// se deja de reintentar (para no trabar el stream local) hasta el proximo
-// conectar() -- es decir, hasta el proximo timbre.
+// Timeout del handshake TLS, en SEGUNDOS (WiFiClientSecure::setHandshakeTimeout).
+#ifndef MQTT_TLS_HANDSHAKE_TIMEOUT_S
+#define MQTT_TLS_HANDSHAKE_TIMEOUT_S 10
+#endif
+
+// Cuantos intentos fallidos seguidos antes de abandonar el backend (para no
+// trabar el stream local). Se reintenta en el proximo conectar().
 #ifndef MQTT_MAX_CONNECT_ATTEMPTS
 #define MQTT_MAX_CONNECT_ATTEMPTS 2
 #endif
 
 namespace
 {
-    const char *TOPIC_PRESS = "home/doorbell/events/press";
-    const char *TOPIC_STREAM_END = "home/doorbell/events/stream_end";
-    const char *TOPIC_CAPTURE_IMAGE = "home/doorbell/events/capture_image";
-    const char *TOPIC_CAPTURE_AUDIO = "home/doorbell/events/capture_audio";
-    const char *TOPIC_IA_RESPONSE = "home/doorbell/events/ia_response";
+    const char *ACTION_PRESS = "press";
+    const char *ACTION_STREAM_END = "stream_end";
+    const char *ACTION_CAPTURE_IMAGE = "capture_image";
+    const char *ACTION_CAPTURE_AUDIO = "capture_audio";
+    const char *ACTION_IA_RESPONSE = "ia_response";
 
-    WiFiClient net;
+    WiFiClientSecure net;
     MQTTClient mqtt(MQTT_BUFFER_SIZE);
 
     String brokerHost;
-    uint16_t brokerPort = 1883;
+    uint16_t brokerPort = 8883;
     String deviceId;
     String clientId;
+    String topicIaResponse; // home/{deviceId}/events/+/ia_response
 
     MqttClient::IaResponseHandler iaHandler = nullptr;
 
@@ -61,19 +67,63 @@ namespace
     unsigned long lastConnectAttempt = 0;
     int connectAttempts = 0; // fallos seguidos; al llegar al max, abandona
 
-    // Epoch en milisegundos UTC, o 0 si el reloj todavia no esta sincronizado
-    // por NTP (WifiManager::connect hace la sincro).
+    // Ultimos messageId vistos, para descartar reentregas QoS 1.
+    constexpr size_t SEEN_IDS = 8;
+    String seenIds[SEEN_IDS];
+    size_t seenNext = 0;
+
+    bool yaVisto(const String &messageId)
+    {
+        if (messageId.length() == 0)
+            return false;
+        for (size_t i = 0; i < SEEN_IDS; i++)
+        {
+            if (seenIds[i] == messageId)
+                return true;
+        }
+        seenIds[seenNext] = messageId;
+        seenNext = (seenNext + 1) % SEEN_IDS;
+        return false;
+    }
+
+    // home/{deviceId}/events/{trackId}/{action}
+    String topicFor(const String &trackId, const char *action)
+    {
+        return "home/" + deviceId + "/events/" + trackId + "/" + action;
+    }
+
+    // Parsea home/{deviceId}/events/{trackId}/{action}. Devuelve false si el
+    // topico no tiene esa forma o no es de este device.
+    bool parseTopic(const String &topic, String &trackId, String &action)
+    {
+        String prefix = "home/" + deviceId + "/events/";
+        if (!topic.startsWith(prefix))
+            return false;
+        int slash = topic.indexOf('/', prefix.length());
+        if (slash < 0)
+            return false;
+        trackId = topic.substring(prefix.length(), slash);
+        action = topic.substring(slash + 1);
+        return trackId.length() > 0 && action.length() > 0 && action.indexOf('/') < 0;
+    }
+
+    // Epoch en milisegundos UTC, o 0 si el reloj todavia no esta sincronizado.
     int64_t nowEpochMillis()
     {
         time_t now = time(nullptr);
         if (now < 1600000000L) // ~2020-09; antes de eso el reloj no arranco
-        {
             return 0;
-        }
         return static_cast<int64_t>(now) * 1000LL;
     }
 
-    void handleIaResponse(const String &payload)
+    void addTimestamp(JsonDocument &doc)
+    {
+        int64_t ts = nowEpochMillis();
+        if (ts > 0)
+            doc["timestamp"] = ts;
+    }
+
+    void handleIaResponse(const String &trackId, const String &payload)
     {
         JsonDocument doc;
         DeserializationError err = deserializeJson(doc, payload);
@@ -84,43 +134,46 @@ namespace
         }
 
         MqttClient::IaResponse r;
-        r.trackId = doc["trackId"] | "";
-        r.deviceId = doc["deviceId"] | "";
+        r.trackId = trackId;
+        r.messageId = doc["messageId"] | "";
         r.chunkType = doc["chunkType"] | "";
         r.action = doc["action"] | "";
         r.severity = doc["severity"] | "";
         r.message = doc["message"] | "";
 
-        // Filtrado por deviceId: ignorar instrucciones de otros timbres.
-        if (r.deviceId.length() > 0 && r.deviceId != deviceId)
+        if (yaVisto(r.messageId))
         {
+            Serial.printf("[MQTT] ia_response duplicado (messageId=%s), ignorado\n",
+                          r.messageId.c_str());
             return;
         }
 
-        Serial.printf("[MQTT] ia_response track=%s chunk=%s action=%s sev=%s\n",
+        Serial.printf("[MQTT] <- ia_response track=%s chunk=%s action=%s sev=%s\n",
                       r.trackId.c_str(), r.chunkType.c_str(),
                       r.action.c_str(), r.severity.c_str());
 
         if (iaHandler)
-        {
             iaHandler(r);
-        }
     }
 
     // Callback de arduino-mqtt (firma simple: topic + payload).
     void onMessage(String &topic, String &payload)
     {
-        if (topic == TOPIC_IA_RESPONSE)
+        String trackId, action;
+        if (!parseTopic(topic, trackId, action))
         {
-            handleIaResponse(payload);
+            Serial.printf("[MQTT] topico inesperado: %s\n", topic.c_str());
+            return;
         }
+        if (action == ACTION_IA_RESPONSE)
+            handleIaResponse(trackId, payload);
     }
 
-    bool publishJson(const char *topic, JsonDocument &doc)
+    bool publishJson(const String &topic, JsonDocument &doc)
     {
         if (!mqtt.connected())
         {
-            Serial.printf("[MQTT] publish a %s descartado: sin conexion\n", topic);
+            Serial.printf("[MQTT] publish a %s descartado: sin conexion\n", topic.c_str());
             return false;
         }
 
@@ -132,46 +185,76 @@ namespace
         if (!ok)
         {
             Serial.printf("[MQTT] publish a %s fallo (err=%d)\n",
-                          topic, mqtt.lastError());
+                          topic.c_str(), mqtt.lastError());
         }
         return ok;
+    }
+
+    void onConnectFailed()
+    {
+        net.stop();
+        connectAttempts++;
+        if (connectAttempts >= MQTT_MAX_CONNECT_ATTEMPTS)
+        {
+            // Broker inalcanzable: dejamos de reintentar para no trabar el
+            // stream local. Se reintenta en el proximo conectar() (timbre).
+            enabled = false;
+            Serial.println("[MQTT] broker inalcanzable, abandono el backend "
+                           "(el stream local sigue)");
+        }
     }
 
     void connectNow()
     {
         if (WiFi.status() != WL_CONNECTED)
-        {
             return; // sin WiFi no hay nada que hacer
-        }
 
         lastConnectAttempt = millis();
-        Serial.printf("[MQTT] conectando a %s:%u como %s... (intento %d/%d)\n",
-                      brokerHost.c_str(), brokerPort, clientId.c_str(),
-                      connectAttempts + 1, MQTT_MAX_CONNECT_ATTEMPTS);
+        Serial.printf("[MQTT] conectando a mqtts://%s:%u (tls-name=%s) como %s... (intento %d/%d)\n",
+                      brokerHost.c_str(), brokerPort, Config::Mqtt::TLS_HOSTNAME,
+                      clientId.c_str(), connectAttempts + 1, MQTT_MAX_CONNECT_ATTEMPTS);
 
-        // Lab: broker plano sin auth. Para user/pass usar connect(id, user, pass).
-        if (mqtt.connect(clientId.c_str()))
+        IPAddress ip;
+        if (!WiFi.hostByName(brokerHost.c_str(), ip))
         {
-            connectAttempts = 0;
-            Serial.println("[MQTT] conectado");
-            subscribed = mqtt.subscribe(TOPIC_IA_RESPONSE, 1);
-            Serial.printf("[MQTT] suscripto a %s (QoS 1)\n", TOPIC_IA_RESPONSE);
+            Serial.printf("[MQTT] no se pudo resolver %s\n", brokerHost.c_str());
+            onConnectFailed();
+            return;
         }
+
+        // 1) TCP + handshake mTLS a mano. Se conecta a la IP pero se valida el
+        //    server cert contra TLS_HOSTNAME (ver Config.h).
+        net.stop();
+        if (!net.connect(ip, brokerPort, Config::Mqtt::TLS_HOSTNAME,
+                         CA_CERT, DEVICE_CERT, DEVICE_KEY))
+        {
+            char err[128] = {0};
+            int code = net.lastError(err, sizeof(err));
+            Serial.printf("[MQTT] handshake TLS fallo (%d): %s\n", code, err);
+            onConnectFailed();
+            return;
+        }
+
+        // 2) CONNECT MQTT sobre el socket ya abierto (skip=true: no reconecta).
+        if (!mqtt.connect(clientId.c_str(), true))
+        {
+            // returnCode 5 = not authorized (CN rechazado por el broker).
+            Serial.printf("[MQTT] CONNECT fallo (err=%d, ret=%d)\n",
+                          mqtt.lastError(), mqtt.returnCode());
+            onConnectFailed();
+            return;
+        }
+
+        connectAttempts = 0;
+        Serial.println("[MQTT] conectado (mTLS)");
+
+        subscribed = mqtt.subscribe(topicIaResponse, 1);
+        if (subscribed)
+            Serial.printf("[MQTT] suscripto a %s (QoS 1)\n", topicIaResponse.c_str());
         else
-        {
-            connectAttempts++;
-            Serial.printf("[MQTT] conexion fallo (err=%d, ret=%d)\n",
-                        mqtt.lastError(), mqtt.returnCode());
-
-            if (connectAttempts >= MQTT_MAX_CONNECT_ATTEMPTS)
-            {
-                // Broker inalcanzable: dejamos de reintentar para no trabar el
-                // stream local. Se reintenta en el proximo conectar() (timbre).
-                enabled = false;
-                Serial.println("[MQTT] broker inalcanzable, abandono el backend "
-                            "(el stream local sigue)");
-            }
-        }
+            Serial.printf("[MQTT] suscripcion a %s RECHAZADA (err=%d). "
+                          "Revisar ACL / CN del cert\n",
+                          topicIaResponse.c_str(), mqtt.lastError());
     }
 }
 
@@ -183,14 +266,14 @@ namespace MqttClient
         brokerPort = port;
         deviceId = id;
         clientId = "timbre-" + id; // unico por dispositivo; nunca "gateway-micro"
+        topicIaResponse = "home/" + deviceId + "/events/+/" + ACTION_IA_RESPONSE;
 
-        // Timeout de la conexion TCP: si el broker no responde, no queremos que
-        // WiFiClient::connect() cuelgue el loop por varios segundos.
-        
+        net.setHandshakeTimeout(MQTT_TLS_HANDSHAKE_TIMEOUT_S);
+
+        // begin() guarda host/puerto, pero la conexion de red la hacemos a mano
+        // en connectNow() (mqtt.connect(..., skip=true)).
         mqtt.begin(brokerHost.c_str(), brokerPort, net);
-        mqtt.setKeepAlive(MQTT_KEEPALIVE_SECONDS);
         // cleanSession=true: no queremos cola persistente del lado del broker.
-        // El 3er parametro es el timeout de comandos/CONNACK (antes 5000).
         mqtt.setOptions(MQTT_KEEPALIVE_SECONDS, true, MQTT_CONNECT_TIMEOUT_MS);
         mqtt.onMessage(onMessage);
 
@@ -206,16 +289,12 @@ namespace MqttClient
     void loop()
     {
         if (!started)
-        {
             return;
-        }
 
         mqtt.loop();
 
         if (!mqtt.connected())
-        {
             subscribed = false; // si se cayo, ya no estamos suscriptos
-        }
 
         if (enabled && !mqtt.connected() &&
             (millis() - lastConnectAttempt) > MQTT_RECONNECT_INTERVAL_MS)
@@ -235,7 +314,8 @@ namespace MqttClient
             return;
         enabled = true;
         connectAttempts = 0; // cada evento arranca con los intentos frescos
-        connectNow();        // dispara el intento; el resultado se resuelve en loop()
+        if (!mqtt.connected())
+            connectNow();
     }
 
     void desconectar()
@@ -244,101 +324,53 @@ namespace MqttClient
         connectAttempts = 0;
         subscribed = false;
         if (mqtt.connected())
-        {
             mqtt.disconnect();
-        }
+        net.stop();
     }
 
     bool listo()
     {
-        // Listo para publicar/recibir: conectado Y suscripto a ia_response.
         return enabled && mqtt.connected() && subscribed;
     }
 
-    bool publishPress(
-        const String &eventId,
-        const String &rtspUrl,
-        const String &imageBase64,
-        float batteryPercentage)
+    bool publishPress(const String &trackId,
+                      const String &imageBase64,
+                      float batteryPercentage)
     {
         JsonDocument doc;
-        doc["eventId"] = eventId; // == trackId de la sesion
-        doc["deviceId"] = deviceId;
         doc["event"] = "press";
-        doc["rtspUrl"] = rtspUrl;
-
-        int64_t ts = nowEpochMillis();
-        if (ts > 0)
-        {
-            doc["timestamp"] = ts;
-        }
+        addTimestamp(doc);
         if (imageBase64.length() > 0)
-        {
             doc["image"] = imageBase64;
-        }
         if (!isnan(batteryPercentage))
-        {
             doc["batteryPercentage"] = batteryPercentage;
-        }
 
-        Serial.printf("[MQTT] -> press eventId=%s rtsp=%s\n",
-                      eventId.c_str(), rtspUrl.c_str());
-        return publishJson(TOPIC_PRESS, doc);
+        String topic = topicFor(trackId, ACTION_PRESS);
+        Serial.printf("[MQTT] -> %s (imagen %u chars)\n",
+                      topic.c_str(), (unsigned)imageBase64.length());
+        return publishJson(topic, doc);
     }
 
     bool publishStreamEnd(const String &trackId)
     {
         JsonDocument doc;
-        doc["trackId"] = trackId;
-        doc["deviceId"] = deviceId;
-
-        int64_t ts = nowEpochMillis();
-        if (ts > 0)
-        {
-            doc["timestamp"] = ts;
-        }
-
-        Serial.printf("[MQTT] -> stream_end trackId=%s\n", trackId.c_str());
-        return publishJson(TOPIC_STREAM_END, doc);
+        addTimestamp(doc);
+        String topic = topicFor(trackId, ACTION_STREAM_END);
+        Serial.printf("[MQTT] -> %s\n", topic.c_str());
+        return publishJson(topic, doc);
     }
 
-    bool publishCaptureImage(const String &trackId, const String &rtspUrl)
+    bool publishCaptureImage(const String &trackId)
     {
         JsonDocument doc;
-        doc["deviceId"] = deviceId;
-        if (trackId.length() > 0)
-        {
-            doc["trackId"] = trackId;
-        }
-        if (rtspUrl.length() > 0)
-        {
-            doc["rtspUrl"] = rtspUrl;
-        }
-        int64_t ts = nowEpochMillis();
-        if (ts > 0)
-        {
-            doc["timestamp"] = ts;
-        }
-        return publishJson(TOPIC_CAPTURE_IMAGE, doc);
+        addTimestamp(doc);
+        return publishJson(topicFor(trackId, ACTION_CAPTURE_IMAGE), doc);
     }
 
-    bool publishCaptureAudio(const String &trackId, const String &rtspUrl)
+    bool publishCaptureAudio(const String &trackId)
     {
         JsonDocument doc;
-        doc["deviceId"] = deviceId;
-        if (trackId.length() > 0)
-        {
-            doc["trackId"] = trackId;
-        }
-        if (rtspUrl.length() > 0)
-        {
-            doc["rtspUrl"] = rtspUrl;
-        }
-        int64_t ts = nowEpochMillis();
-        if (ts > 0)
-        {
-            doc["timestamp"] = ts;
-        }
-        return publishJson(TOPIC_CAPTURE_AUDIO, doc);
+        addTimestamp(doc);
+        return publishJson(topicFor(trackId, ACTION_CAPTURE_AUDIO), doc);
     }
 }

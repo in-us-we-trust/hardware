@@ -218,7 +218,7 @@ namespace BleManager
 
         if (WifiManager::connect(ssid, password))
         {
-            String deviceId = Device::getOrCreateDeviceId();
+            String deviceId = Device::getDeviceId();
             String mac = WiFi.macAddress();
             String response = "{\"deviceId\":\"" + deviceId + "\",\"mac\":\"" + mac + "\"}";
             WebPortal::sendSSE("✅ Conectado! RED: " + ssid + " | Registrando en el gateway...");

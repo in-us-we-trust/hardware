@@ -1,0 +1,308 @@
+diff --git a/timbre/.gitignore b/timbre/.gitignore
+index 7bc4959..bf7e196 100644
+--- a/timbre/.gitignore
++++ b/timbre/.gitignore
+@@ -5,8 +5,7 @@
+ .vscode/ipch
+ lib/Certs/Certs.cpp
+ lib/Certs/output/
+-# Credenciales MQTT (certificados y clave privada del dispositivo)
+-lib/MqttClient/certs/
+-lib/MqttClient/MqttCerts.cpp
++# Identidad mTLS del dispositivo (certificados y clave privada)
++lib/Certs/certs/
+ *.pem
+ *.key
+diff --git a/timbre/lib/BleManager/BleManager.cpp b/timbre/lib/BleManager/BleManager.cpp
+index f1354b5..3eff77d 100644
+--- a/timbre/lib/BleManager/BleManager.cpp
++++ b/timbre/lib/BleManager/BleManager.cpp
+@@ -218,7 +218,7 @@ namespace BleManager
+ 
+         if (WifiManager::connect(ssid, password))
+         {
+-            String deviceId = Device::getOrCreateDeviceId();
++            String deviceId = Device::getDeviceId();
+             String mac = WiFi.macAddress();
+             String response = "{\"deviceId\":\"" + deviceId + "\",\"mac\":\"" + mac + "\"}";
+             WebPortal::sendSSE("✅ Conectado! RED: " + ssid + " | Registrando en el gateway...");
+diff --git a/timbre/lib/Config/Config.h b/timbre/lib/Config/Config.h
+index a0486e8..d58312e 100644
+--- a/timbre/lib/Config/Config.h
++++ b/timbre/lib/Config/Config.h
+@@ -37,8 +37,20 @@
+ #define MEDIAMTX_PATH "doorbell"
+ #endif
+ 
++// --- Identidad del dispositivo ----------------------------------------------
++// Sin default a proposito: tiene que coincidir con el CN del certificado del
++// dispositivo (lib/Certs/certs/device.pem). Se define en platformio.ini.
++#ifndef DEVICE_ID
++#error "Falta -DDEVICE_ID en platformio.ini (tiene que ser el CN de device.pem)"
++#endif
++
+ namespace Config
+ {
++    namespace Identity
++    {
++        constexpr const char *ID = DEVICE_ID;
++    }
++
+     // --- Entorno de build: hardware real vs. simulador Wokwi ----------------
+     // Wokwi no simula camara, BLE ni modo AP. En vez de #ifdef WOKWI_SIM
+     // repartidos por el codigo, un solo bool que se puede usar con "if" normal.
+diff --git a/timbre/lib/Device/Device.cpp b/timbre/lib/Device/Device.cpp
+index 252556d..b6fded1 100644
+--- a/timbre/lib/Device/Device.cpp
++++ b/timbre/lib/Device/Device.cpp
+@@ -1,6 +1,10 @@
+ #include "Device.h"
+-#include "Storage.h"
++#include "Config.h"
++#include "Certs.h"
+ #include "esp_system.h"
++#include <string.h>
++#include <mbedtls/x509_crt.h>
++#include <mbedtls/oid.h>
+ 
+ namespace Device
+ {
+@@ -24,22 +28,49 @@ namespace Device
+         return String(uuidStr);
+     }
+ 
+-    // Genera el UUID la primera vez y lo persiste en flash.
+-    // Reinicios posteriores reusan el mismo ID.
+-    String getOrCreateDeviceId()
++    String getDeviceId()
+     {
+-        String id = Storage::loadDeviceId();
+-        if (id.isEmpty())
++        return String(Config::Identity::ID);
++    }
++
++    bool certMatchesDeviceId()
++    {
++        mbedtls_x509_crt crt;
++        mbedtls_x509_crt_init(&crt);
++
++        // mbedtls necesita el largo incluyendo el '\0' para PEM.
++        int rc = mbedtls_x509_crt_parse(&crt, reinterpret_cast<const unsigned char *>(DEVICE_CERT),
++                                        strlen(DEVICE_CERT) + 1);
++        if (rc != 0)
+         {
+-            id = generateUUID();
+-            Storage::saveDeviceId(id);
+-            Serial.println("UUID generado: " + id);
++            Serial.printf("[Device] ERROR: DEVICE_CERT invalido (mbedtls -0x%04X)\n", -rc);
++            mbedtls_x509_crt_free(&crt);
++            return false;
+         }
+-        else
++
++        String cn;
++        for (const mbedtls_x509_name *n = &crt.subject; n != nullptr; n = n->next)
++        {
++            if (MBEDTLS_OID_CMP(MBEDTLS_OID_AT_CN, &n->oid) == 0)
++            {
++                cn.reserve(n->val.len);
++                for (size_t i = 0; i < n->val.len; i++)
++                    cn += static_cast<char>(n->val.p[i]);
++                break;
++            }
++        }
++        mbedtls_x509_crt_free(&crt);
++
++        String id = getDeviceId();
++        if (cn != id)
+         {
+-            Serial.println("UUID existente: " + id);
++            Serial.printf("[Device] ERROR: CN del cert (%s) != DEVICE_ID (%s). "
++                          "El ACL del broker va a descartar los mensajes.\n",
++                          cn.c_str(), id.c_str());
++            return false;
+         }
+-        return id;
++        Serial.printf("[Device] identidad OK: CN = DEVICE_ID = %s\n", id.c_str());
++        return true;
+     }
+ 
+     String getBleName()
+diff --git a/timbre/lib/Device/Device.h b/timbre/lib/Device/Device.h
+index 272cdf2..942f03b 100644
+--- a/timbre/lib/Device/Device.h
++++ b/timbre/lib/Device/Device.h
+@@ -2,16 +2,24 @@
+ #include <Arduino.h>
+ 
+ // ---------------------------------------------------------------------------
+-// Device: identidad del dispositivo (UUID estable y nombre BLE derivado del
+-// chip). Usa Storage para persistir el UUID entre reinicios.
++// Device: identidad del dispositivo y nombre BLE derivado del chip.
++//
++// El deviceId es FIJO (Config::Identity::ID, build flag DEVICE_ID) y tiene
++// que ser el CN del certificado del dispositivo: Mosquitto lo usa como
++// username y el ACL solo permite home/<CN>/#. Ya no se genera un UUID random.
+ // ---------------------------------------------------------------------------
+ namespace Device
+ {
+-    // Genera un UUID v4 nuevo (no lo persiste).
++    // Genera un UUID v4 nuevo (no lo persiste). Se usa para los trackId.
+     String generateUUID();
+ 
+-    // Devuelve el UUID persistido; si no existe, lo genera y lo guarda.
+-    String getOrCreateDeviceId();
++    // deviceId del timbre (= CN del certificado).
++    String getDeviceId();
++
++    // true si el CN de DEVICE_CERT coincide con getDeviceId(). Si no coincide,
++    // loguea el error: el broker aceptaria la conexion pero el ACL descartaria
++    // todos los mensajes en silencio.
++    bool certMatchesDeviceId();
+ 
+     // Nombre BLE/AP derivado del MAC del chip, ej: "TIMBRE-A1B2C3"
+     String getBleName();
+diff --git a/timbre/lib/ModoOperacion/ModoOperacion.cpp b/timbre/lib/ModoOperacion/ModoOperacion.cpp
+index ea4f5e5..e73fccd 100644
+--- a/timbre/lib/ModoOperacion/ModoOperacion.cpp
++++ b/timbre/lib/ModoOperacion/ModoOperacion.cpp
+@@ -50,7 +50,8 @@ namespace ModoOperacion
+ {
+     void begin()
+     {
+-        deviceId = Device::getOrCreateDeviceId();
++        deviceId = Device::getDeviceId();
++        Device::certMatchesDeviceId();
+         Serial.printf("[APP] deviceId = %s\n", deviceId.c_str());
+         Serial.println("[APP] serial: 'p' = timbrar, 'e' = colgar (local)");
+ 
+diff --git a/timbre/lib/MqttClient/MqttCerts.h b/timbre/lib/MqttClient/MqttCerts.h
+deleted file mode 100644
+index 7dcc243..0000000
+--- a/timbre/lib/MqttClient/MqttCerts.h
++++ /dev/null
+@@ -1,12 +0,0 @@
+-#pragma once
+-
+-// ---------------------------------------------------------------------------
+-// MqttCerts: certificados y clave privada del dispositivo para el handshake
+-// mTLS contra el broker MQTT. El contenido real (los PEM) vive en MqttCerts.cpp,
+-// que se genera a partir de lib/MqttClient/certs/*.pem y NO se edita a mano.
+-//
+-// Mismo patron que Certs.h / Certs.cpp.
+-// ---------------------------------------------------------------------------
+-extern const char MQTT_CA_CERT[];
+-extern const char MQTT_DEVICE_CERT[];
+-extern const char MQTT_DEVICE_KEY[];
+diff --git a/timbre/lib/MqttClient/MqttClient.h b/timbre/lib/MqttClient/MqttClient.h
+index 1cc86da..5b1c252 100644
+--- a/timbre/lib/MqttClient/MqttClient.h
++++ b/timbre/lib/MqttClient/MqttClient.h
+@@ -15,7 +15,7 @@
+ //
+ // Reglas del contrato que respeta este modulo:
+ //   - QoS 1 y sin retain en todo.
+-//   - deviceId estable (Device::getOrCreateDeviceId), eventId nuevo por llamada.
++//   - deviceId estable (Device::getDeviceId), eventId nuevo por llamada.
+ //   - eventId del press == trackId de toda la sesion; vuelve en ia_response y va
+ //     en stream_end.
+ //   - El JSON es UTF-8 valido (ArduinoJson). No se manda media binaria por MQTT.
+@@ -30,7 +30,7 @@
+ // (serializeJson compacto), publicado con QoS 1 y retain=false.
+ //
+ // Campos comunes:
+-//   deviceId   string  - Device::getOrCreateDeviceId(). Siempre presente.
++//   deviceId   string  - Device::getDeviceId(). Siempre presente.
+ //   timestamp  int64   - epoch en MILISEGUNDOS UTC. SE OMITE si el reloj no
+ //                        esta sincronizado por NTP (time(nullptr) < 2020-09).
+ //                        O sea: el gateway no puede asumir que exista.
+diff --git a/timbre/lib/Storage/Storage.cpp b/timbre/lib/Storage/Storage.cpp
+index c7c6de4..10c0674 100644
+--- a/timbre/lib/Storage/Storage.cpp
++++ b/timbre/lib/Storage/Storage.cpp
+@@ -8,21 +8,6 @@ namespace
+ 
+ namespace Storage
+ {
+-    String loadDeviceId()
+-    {
+-        prefs.begin("device", true);
+-        String id = prefs.getString("uuid", "");
+-        prefs.end();
+-        return id;
+-    }
+-
+-    void saveDeviceId(const String &id)
+-    {
+-        prefs.begin("device", false);
+-        prefs.putString("uuid", id);
+-        prefs.end();
+-    }
+-
+     bool loadDeviceRegistered()
+     {
+         prefs.begin("device", true);
+diff --git a/timbre/lib/Storage/Storage.h b/timbre/lib/Storage/Storage.h
+index 6ebdaa4..9766b1c 100644
+--- a/timbre/lib/Storage/Storage.h
++++ b/timbre/lib/Storage/Storage.h
+@@ -8,8 +8,6 @@
+ namespace Storage
+ {
+     // --- Identidad del dispositivo (namespace "device") ---
+-    String loadDeviceId();
+-    void saveDeviceId(const String &id);
+     bool loadDeviceRegistered();
+     void saveDeviceRegistered(bool registered);
+ 
+diff --git a/timbre/platformio.ini b/timbre/platformio.ini
+index a3f8dca..91ffebc 100644
+--- a/timbre/platformio.ini
++++ b/timbre/platformio.ini
+@@ -9,6 +9,9 @@ build_flags =
+     -DBOARD_HAS_PSRAM
+     -DARDUINO_USB_CDC_ON_BOOT=1
+     -DARDUINO_USB_MODE=1
++    ; Identidad del timbre. Tiene que ser IGUAL al CN de lib/Certs/certs/device.pem
++    ; (Mosquitto usa el CN como username y el ACL solo permite home/<CN>/#).
++    -DDEVICE_ID='"f6d44bb5-7f59-4635-bc53-f7d7eb0c1f9f"'
+     -DMQTT_BROKER_HOST='"192.168.1.69"'
+     -DMQTT_BROKER_PORT=1883
+     ; -DMQTT_BROKER_HOST='"bore.pub"'
+diff --git a/timbre/scripts/gen_certs_cpp.py b/timbre/scripts/gen_certs_cpp.py
+new file mode 100644
+index 0000000..b5ad4c1
+--- /dev/null
++++ b/timbre/scripts/gen_certs_cpp.py
+@@ -0,0 +1,31 @@
++#!/usr/bin/env python3
++"""Genera lib/Certs/Certs.cpp a partir de lib/Certs/certs/{ca,device,device-key}.pem.
++
++Uso (desde timbre/):  python3 scripts/gen_certs_cpp.py
++
++El CN de device.pem tiene que ser igual a DEVICE_ID en platformio.ini:
++Mosquitto usa el CN como username y el ACL solo deja tocar home/<CN>/#.
++"""
++from pathlib import Path
++import sys
++
++ROOT = Path(__file__).resolve().parent.parent
++SRC = ROOT / "lib" / "Certs" / "certs"
++OUT = ROOT / "lib" / "Certs" / "Certs.cpp"
++
++FILES = [("CA_CERT", "ca.pem"), ("DEVICE_CERT", "device.pem"), ("DEVICE_KEY", "device-key.pem")]
++
++parts = ['#include "Certs.h"', "#include <pgmspace.h>", "",
++         "// Generado por scripts/gen_certs_cpp.py a partir de lib/Certs/certs/*.pem.",
++         "// No editar a mano. Esta en .gitignore: no commitear.", ""]
++for name, fname in FILES:
++    path = SRC / fname
++    if not path.exists():
++        sys.exit(f"Falta {path}")
++    pem = path.read_text().strip()
++    if ")EOF" in pem:
++        sys.exit(f"{fname} contiene ')EOF'")
++    parts.append(f'const char {name}[] PROGMEM = R"EOF({pem}\n)EOF";\n')
++
++OUT.write_text("\n".join(parts))
++print(f"OK -> {OUT.relative_to(ROOT)}")

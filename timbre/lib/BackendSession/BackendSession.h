@@ -51,12 +51,19 @@ namespace BackendSession
     // una constante hardcodeada de prueba, sin pasar por la fuente).
     bool enviarFotoBase64(const String &trackId, const String &fotoBase64);
 
-    // Arranca el stream RTSP hacia MediaMTX. Negocia todos los tracks con
-    // fuente (video y audio quedan disponibles), pero NO envia nada todavia.
-    // Se llama despues de que el press salio OK. El audio y el video NO se
-    // mandan como blobs: van por RTSP y el gateway los extrae en chunks
-    // (ExtractVideoChunk/ExtractAudioChunk). Devuelve true si el stream arranco.
-    bool iniciarMedia();
+    // Arranca el stream RTSPS hacia MediaMTX en {deviceId}/doorbell/{trackId}.
+    // Negocia todos los tracks con fuente, pero NO envia nada todavia.
+    // Contrato: el path tiene que estar READY ANTES del press (si no, el PLAY
+    // del gateway da 404). Por eso EventFlow lo llama antes de enviarFoto y
+    // espera mediaLista(). El audio y el video van por RTSP y el gateway los
+    // extrae en chunks. Devuelve true si arranco la negociacion (TLS OK).
+    bool iniciarMedia(const String &trackId);
+
+    // true cuando MediaMTX acepto el RECORD (path ready para el PLAY del gateway).
+    bool mediaLista();
+
+    // true si la negociacion RTSP fallo (TLS, 401, SETUP...).
+    bool mediaFallo();
 
     // Prende/apaga el envio de cada track EN VIVO (sin reconectar). Lo llama
     // EventFlow segun su deteccion: audio cuando hay sonido, video cuando el

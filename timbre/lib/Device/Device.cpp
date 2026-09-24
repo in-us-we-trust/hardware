@@ -1,6 +1,10 @@
 #include "Device.h"
-#include "Storage.h"
+#include "Config.h"
+#include "Certs.h"
 #include "esp_system.h"
+#include <string.h>
+#include <mbedtls/x509_crt.h>
+#include <mbedtls/oid.h>
 
 namespace Device
 {
@@ -24,22 +28,49 @@ namespace Device
         return String(uuidStr);
     }
 
-    // Genera el UUID la primera vez y lo persiste en flash.
-    // Reinicios posteriores reusan el mismo ID.
-    String getOrCreateDeviceId()
+    String getDeviceId()
     {
-        String id = Storage::loadDeviceId();
-        if (id.isEmpty())
+        return String(Config::Identity::ID);
+    }
+
+    bool certMatchesDeviceId()
+    {
+        mbedtls_x509_crt crt;
+        mbedtls_x509_crt_init(&crt);
+
+        // mbedtls necesita el largo incluyendo el '\0' para PEM.
+        int rc = mbedtls_x509_crt_parse(&crt, reinterpret_cast<const unsigned char *>(DEVICE_CERT),
+                                        strlen(DEVICE_CERT) + 1);
+        if (rc != 0)
         {
-            id = generateUUID();
-            Storage::saveDeviceId(id);
-            Serial.println("UUID generado: " + id);
+            Serial.printf("[Device] ERROR: DEVICE_CERT invalido (mbedtls -0x%04X)\n", -rc);
+            mbedtls_x509_crt_free(&crt);
+            return false;
         }
-        else
+
+        String cn;
+        for (const mbedtls_x509_name *n = &crt.subject; n != nullptr; n = n->next)
         {
-            Serial.println("UUID existente: " + id);
+            if (MBEDTLS_OID_CMP(MBEDTLS_OID_AT_CN, &n->oid) == 0)
+            {
+                cn.reserve(n->val.len);
+                for (size_t i = 0; i < n->val.len; i++)
+                    cn += static_cast<char>(n->val.p[i]);
+                break;
+            }
         }
-        return id;
+        mbedtls_x509_crt_free(&crt);
+
+        String id = getDeviceId();
+        if (cn != id)
+        {
+            Serial.printf("[Device] ERROR: CN del cert (%s) != DEVICE_ID (%s). "
+                          "El ACL del broker va a descartar los mensajes.\n",
+                          cn.c_str(), id.c_str());
+            return false;
+        }
+        Serial.printf("[Device] identidad OK: CN = DEVICE_ID = %s\n", id.c_str());
+        return true;
     }
 
     String getBleName()

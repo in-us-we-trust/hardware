@@ -5,8 +5,7 @@
 .vscode/ipch
 lib/Certs/Certs.cpp
 lib/Certs/output/
-# Credenciales MQTT (certificados y clave privada del dispositivo)
-lib/MqttClient/certs/
-lib/MqttClient/MqttCerts.cpp
+# Identidad mTLS del dispositivo (certificados y clave privada)
+lib/Certs/certs/
 *.pem
 *.key

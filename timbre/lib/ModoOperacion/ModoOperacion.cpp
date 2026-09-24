@@ -50,7 +50,8 @@ namespace ModoOperacion
 {
     void begin()
     {
-        deviceId = Device::getOrCreateDeviceId();
+        deviceId = Device::getDeviceId();
+        Device::certMatchesDeviceId();
         Serial.printf("[APP] deviceId = %s\n", deviceId.c_str());
         Serial.println("[APP] serial: 'p' = timbrar, 'e' = colgar (local)");
 
