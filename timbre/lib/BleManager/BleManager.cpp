@@ -79,7 +79,7 @@ namespace
 
             if (status == "success")
             {
-                WebPortal::sendSSE("✅ Dispositivo vinculado!");
+                WebPortal::sendSSE("Dispositivo vinculado!");
                 Storage::saveDeviceRegistered(true);
                 awaitingRegistrationConfirmation = false;
                 gatewayReady = true;
@@ -89,7 +89,7 @@ namespace
             }
             else
             {
-                WebPortal::sendSSE("❌ Registro fallido. Reiniciando...");
+                WebPortal::sendSSE("Registro fallido. Reiniciando...");
                 delay(1000);
                 ESP.restart(); // Vuelve a mostrar el QR desde cero
             }
@@ -221,7 +221,7 @@ namespace BleManager
             String deviceId = Device::getOrCreateDeviceId();
             String mac = WiFi.macAddress();
             String response = "{\"deviceId\":\"" + deviceId + "\",\"mac\":\"" + mac + "\"}";
-            WebPortal::sendSSE("✅ Conectado! RED: " + ssid + " | Registrando en el gateway...");
+            WebPortal::sendSSE("Conectado! RED: " + ssid + " | Registrando en el gateway...");
 
             if (pCharacteristicWifi != nullptr)
             {
@@ -260,12 +260,12 @@ namespace BleManager
                 {
                     gatewayReady = true;
                     lastEventSentAt = millis() - 30000;
-                    WebPortal::sendSSE("✅ Dispositivo ya registrado. Enviando events...");
+                    WebPortal::sendSSE("Dispositivo ya registrado. Enviando events...");
                 }
                 else
                 {
                     awaitingRegistrationConfirmation = true;
-                    WebPortal::sendSSE("✅ Dispositivo registrado en el gateway. Enviá confirmacion en nRF Connect al characteristic 12345678-1234-1234-1234-123456789002 con {\"status\":\"success\"}.");
+                    WebPortal::sendSSE("Dispositivo registrado en el gateway. Enviá confirmacion en nRF Connect al characteristic 12345678-1234-1234-1234-123456789002 con {\"status\":\"success\"}.");
                 }
             }
             else
@@ -275,7 +275,7 @@ namespace BleManager
         }
         else
         {
-            WebPortal::sendSSE("❌ No se pudo conectar. Verificá las credenciales.");
+            WebPortal::sendSSE(" No se pudo conectar. Verificá las credenciales.");
             if (pCharacteristicWifi != nullptr)
             {
                 pCharacteristicWifi->setValue("{\"error\":\"wifi_failed\"}");

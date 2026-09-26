@@ -5,16 +5,12 @@
 #include "Screen.h"
 #include "EventFlow.h"
 #include "PowerMode.h"
-#include "MockMediaSource.h"
 #include "PersonDetector.h"
 
 #include <Arduino.h>
 
 namespace
 {
-    // Fuente de la foto. Hoy mock (JPEG embebido); manana CameraMediaSource.
-    MockMediaSource fotoSource(1);
-
     String deviceId;
 
     // --- Boton fisico (timbre) ----------------------------------------------
@@ -59,7 +55,7 @@ namespace ModoOperacion
         attachInterrupt(digitalPinToInterrupt(Config::Button::PIN), onButton, FALLING);
 
         Screen::begin();                              // Visor
-        EventFlow::initialize(deviceId, &fotoSource); // Lo inicializa. Pero no comienza hasta onTimbre
+        EventFlow::initialize(deviceId);
         PersonDetector::begin();                      // TFLite + tensor arena en PSRAM
 
         // Arrancamos en reposo: camara off, CPU 80MHz, WiFi modem sleep.
