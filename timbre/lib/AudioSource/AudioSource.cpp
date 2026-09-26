@@ -2,6 +2,10 @@
 #include <driver/i2s.h>
 #include <math.h>
 
+#ifdef AUDIO_TEST_MODE
+#include "audio_prueba.h" // unsigned char test_ulaw[]; unsigned int test_ulaw_len;
+#endif
+
 namespace
 {
     const i2s_port_t I2S_PORT = I2S_NUM_0;
@@ -52,6 +56,15 @@ bool AudioSource::begin()
     if (_ready)
         return true;
 
+#ifdef AUDIO_TEST_MODE
+    // Modo prueba: no tocamos el I2S real, servimos el audio embebido.
+    _testPos = 0;
+    _lastChunkMs = 0;
+    _ready = true;
+    Serial.printf("[MIC] MODO TEST: sirviendo audio embebido (%u bytes, %.1fs)\n",
+                  test_ulaw_len, test_ulaw_len / 8000.0f);
+    return true;
+#else
     // CLAVE: I2S_MODE_PDM en el mode. Sin esto, el core 2.x no decodifica el
     // stream PDM del microfono y sale un zumbido constante.
     i2s_config_t i2s_config = {
@@ -100,10 +113,15 @@ bool AudioSource::begin()
     _ready = true;
     Serial.println("[MIC] PDM listo (16kHz -> G.711 u-law 8kHz, gain x16)");
     return true;
+#endif
 }
 
 void AudioSource::end()
 {
+#ifdef AUDIO_TEST_MODE
+    _ready = false;
+    Serial.println("[MIC] MODO TEST: detenido");
+#else
     if (_ready)
     {
         i2s_driver_uninstall(I2S_PORT);
@@ -113,10 +131,14 @@ void AudioSource::end()
         _level = 0;
         Serial.println("[MIC] apagado");
     }
+#endif
 }
 
 void AudioSource::loop()
 {
+#ifdef AUDIO_TEST_MODE
+    return; // en modo test, nextAudioChunk() sirve directo del array embebido
+#else
     if (!_ready)
         return;
 
@@ -145,6 +167,7 @@ void AudioSource::loop()
             _pcmCount = 0;
         }
     }
+#endif
 }
 
 void AudioSource::encodeChunk()
@@ -162,12 +185,38 @@ void AudioSource::encodeChunk()
 
 bool AudioSource::nextAudioChunk(const uint8_t **data, size_t *len)
 {
+#ifdef AUDIO_TEST_MODE
+    if (!_ready)
+        return false;
+
+    // Un chunk cada 20ms (mismo ritmo que el micrografo real, 160 bytes @ 8kHz).
+    unsigned long now = millis();
+    if (now - _lastChunkMs < 20)
+        return false;
+    _lastChunkMs = now;
+
+    if (_testPos + AUDIO_CHUNK_SAMPLES > test_ulaw_len)
+        _testPos = 0; // loop: volver al principio del audio de prueba
+
+    *data = &test_ulaw[_testPos];
+    *len = AUDIO_CHUNK_SAMPLES;
+    _testPos += AUDIO_CHUNK_SAMPLES;
+
+    // Nivel aproximado para la animacion (u-law: 0x7F/0xFF ~ silencio digital)
+    uint32_t sum = 0;
+    for (int i = 0; i < AUDIO_CHUNK_SAMPLES; i++)
+        sum += abs((int)test_ulaw[_testPos - AUDIO_CHUNK_SAMPLES + i] - 0xFF);
+    _level = (uint16_t)(sum * 20); // escalado grosero, solo para la barra
+
+    return true;
+#else
     if (!_chunkReady)
         return false;
     *data = _ulawBuf;
     *len = AUDIO_CHUNK_SAMPLES;
     _chunkReady = false;
     return true;
+#endif
 }
 
 AudioSource Microphone;

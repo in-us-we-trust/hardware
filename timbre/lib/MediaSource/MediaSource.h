@@ -5,8 +5,8 @@
 // MediaSource: interfaz de la fuente de media que consume el RtspPublisher.
 // Desacopla "de donde salen los bytes" de "como se publican por RTSP".
 //
-// Implementacion actual:
-//   - CameraMediaSource -> OV2640 + mic PDM reales (fase C, con la XIAO)
+// La implementacion de video actual es CameraSource. El audio se administra
+// por separado mediante AudioSource.
 //
 // El RtspPublisher habla SIEMPRE con esta interfaz y no sabe cual esta enchufada.
 // Es una interfaz (clase abstracta), no un namespace, justamente porque hay

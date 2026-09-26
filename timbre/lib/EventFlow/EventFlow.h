@@ -1,5 +1,6 @@
 #pragma once
 #include <Arduino.h>
+#include "MediaSource.h"
 
 // ---------------------------------------------------------------------------
 // EventFlow: POLITICA + ciclo de vida. Encapsula a BackendSession (el main no
@@ -18,8 +19,9 @@
 
 namespace EventFlow
 {
-    // Configura la capa. Adentro hace BackendSession::initialize.
-    void initialize(const String &deviceId);
+    // Configura la capa. deviceId para el transporte; source de donde sacar la
+    // foto (mock hoy, camara manana). Adentro hace BackendSession::initialize.
+    void initialize(const String &deviceId, MediaSource *source);
 
     // Se llama al tocar el timbre: arranca conexion + saca la foto (no bloquea).
     void onTimbre();

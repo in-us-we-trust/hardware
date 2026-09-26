@@ -26,11 +26,15 @@ namespace
     {
         OFF,        // sin sesion de backend: con evento activo, re-evalua cada
                     // EVAL_INTERVAL_MS si hay motivo (sonido/persona) para conectar
+        CONECTANDO, // conectando al broker MQTT
         EN_SESION   // press enviado, publicando media
     };
 
+    MediaSource *src = nullptr;
+
     bool eventoActivo = false;
     Backend backend = Backend::OFF;
+    unsigned long conectandoDesde = 0;
     unsigned long ultimaEvaluacionMs = 0;
     String trackId = "";
 
@@ -227,8 +231,11 @@ namespace
 
 namespace EventFlow
 {
-    void initialize(const String &deviceId)
+    void initialize(const String &deviceId, MediaSource *source)
     {
+        src = source;
+        if (src)
+            src->begin();
         // BackendSession es dueño del transporte (MQTT + RTSP). Le pasamos las
         // fuentes de media que el stream RTSP va a publicar.
         BackendSession::initialize(deviceId, &Camera, &Microphone);
@@ -326,7 +333,9 @@ namespace EventFlow
                     audioDetectado = sonido;
                     videoDetectado = persona;
                     // BackendSession::conectar();
+                    conectandoDesde = millis();
                     backend = Backend::EN_SESION;
+                    // backend = Backend::CONECTANDO;
                 }
                 else
                 {
@@ -369,6 +378,38 @@ namespace EventFlow
                 }
             }
         }
+
+        // bloque comentado hasta tener el backend listo nuevamente
+        // if (backend == Backend::CONECTANDO)
+        // {
+        //     if (BackendSession::estaListo())
+        //     {
+        //         // Si todavia no hay foto (fallo la del timbre), sacamos una ahora.
+        //         if (fotoLen == 0)
+        //             capturarFoto();
+        //         if (!BackendSession::enviarFotoBase64(trackId, CameraSource::toBase64(foto, fotoLen)))
+        //         {
+        //             Serial.println("[FLOW] fallo el press: backend OFF, sigo evaluando (el evento local sigue)");
+        //             backend = Backend::OFF;
+        //         }
+        //         else
+        //         {
+        //             Serial.printf("[FLOW] sesion de backend iniciada trackId=%s\n", trackId.c_str());
+        //             backend = Backend::EN_SESION;
+
+        //             // Negocia video+audio y prende de entrada lo que disparo la
+        //             // conexion. Lo que falta lo prende loop() al detectarlo.
+        //             BackendSession::iniciarMedia();
+        //             BackendSession::activarAudio(audioDetectado);
+        //             BackendSession::activarVideo(videoDetectado);
+        //         }
+        //     }
+        //     else if (millis() - conectandoDesde > Config::Event::BACKEND_CONNECT_TIMEOUT_MS)
+        //     {
+        //         Serial.println("[FLOW] timeout conectando backend: backend OFF, sigo evaluando (sigue el local)");
+        //         backend = Backend::OFF;
+        //     }
+        // }
 
         if (hangupPedido)
         {

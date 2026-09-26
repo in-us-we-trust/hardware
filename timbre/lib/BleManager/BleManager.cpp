@@ -275,7 +275,7 @@ namespace BleManager
         }
         else
         {
-            WebPortal::sendSSE(" No se pudo conectar. Verificá las credenciales.");
+            WebPortal::sendSSE("No se pudo conectar. Verificá las credenciales.");
             if (pCharacteristicWifi != nullptr)
             {
                 pCharacteristicWifi->setValue("{\"error\":\"wifi_failed\"}");
