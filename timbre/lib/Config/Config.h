@@ -213,6 +213,8 @@ namespace Config
         constexpr uint16_t PORT = MEDIAMTX_PORT;
         constexpr const char *PATH = MEDIAMTX_PATH; // segmento del medio: {deviceId}/doorbell/{trackId}
         constexpr const char *TLS_HOSTNAME = MEDIAMTX_TLS_HOSTNAME;
+        // Copia propia del frame que manda RtspPublisher (PSRAM). Mismo tope que MJPEG.
+        constexpr size_t FRAME_BUF_SIZE = 100 * 1024;
         constexpr const char *USER = MEDIAMTX_USER;
         constexpr const char *PASS = MEDIAMTX_PASS;
     }

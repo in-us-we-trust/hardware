@@ -74,8 +74,10 @@ bool AudioSource::begin()
         .channel_format = I2S_CHANNEL_FMT_ONLY_RIGHT, // el mic del XIAO S3 esta en el canal RIGHT
         .communication_format = I2S_COMM_FORMAT_STAND_I2S,
         .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-        .dma_buf_count = 8,
-        .dma_buf_len = 256,
+        // 12 x 1024 muestras @16kHz = ~768 ms de colchon (24 KB de RAM interna).
+        // Antes 8 x 256 = 128 ms: cualquier vuelta mas lenta del loop perdia audio.
+        .dma_buf_count = 12,
+        .dma_buf_len = 1024,
         .use_apll = false,
         .tx_desc_auto_clear = false,
         .fixed_mclk = 0};
@@ -107,7 +109,8 @@ bool AudioSource::begin()
     i2s_set_clk(I2S_PORT, 16000, I2S_BITS_PER_SAMPLE_16BIT, I2S_CHANNEL_MONO);
 
     _pcmCount = 0;
-    _chunkReady = false;
+    _qHead = 0;
+    _qCount = 0;
     _level = 0;
     _warmupUntilMs = millis() + MIC_WARMUP_MS;
     _ready = true;
@@ -126,7 +129,8 @@ void AudioSource::end()
     {
         i2s_driver_uninstall(I2S_PORT);
         _ready = false;
-        _chunkReady = false;
+        _qHead = 0;
+        _qCount = 0;
         _pcmCount = 0;
         _level = 0;
         Serial.println("[MIC] apagado");
@@ -142,29 +146,34 @@ void AudioSource::loop()
     if (!_ready)
         return;
 
-    int16_t tmpBuf[256];
-    size_t bytesRead = 0;
-    esp_err_t err = i2s_read(I2S_PORT, tmpBuf, sizeof(tmpBuf), &bytesRead, 0);
-    if (err != ESP_OK || bytesRead == 0)
-        return;
-
-    size_t samplesRead = bytesRead / sizeof(int16_t);
-
-    // El mic PDM tiene un offset DC (~1300). Lo estimamos con un promedio movil
-    // y lo restamos, asi el audio queda centrado en 0 antes de amplificar.
+    // Drenar TODO lo que haya en el DMA (antes se leian max 256 muestras =
+    // 16 ms por vuelta y el resto se perdia). Tope de iteraciones por las dudas.
+    static int16_t tmpBuf[512];
     static float dcOffset = 1300.0f;
-    bool warmup = (long)(millis() - _warmupUntilMs) < 0;
-    for (size_t i = 0; i < samplesRead; i++)
+    for (int iter = 0; iter < 64; iter++)
     {
-        dcOffset += (tmpBuf[i] - dcOffset) * 0.001f; // seguimiento lento del DC
-        if (warmup)
-            continue; // descartamos, pero el DC ya va convergiendo
-        int16_t centered = (int16_t)(tmpBuf[i] - dcOffset);
-        _pcmBuf[_pcmCount++] = applyGain(centered);
-        if (_pcmCount >= AUDIO_PCM_SAMPLES_PER_CHUNK)
+        size_t bytesRead = 0;
+        esp_err_t err = i2s_read(I2S_PORT, tmpBuf, sizeof(tmpBuf), &bytesRead, 0);
+        if (err != ESP_OK || bytesRead == 0)
+            break;
+
+        size_t samplesRead = bytesRead / sizeof(int16_t);
+
+        // El mic PDM tiene un offset DC (~1300). Lo estimamos con un promedio movil
+        // y lo restamos, asi el audio queda centrado en 0 antes de amplificar.
+        bool warmup = (long)(millis() - _warmupUntilMs) < 0;
+        for (size_t i = 0; i < samplesRead; i++)
         {
-            encodeChunk();
-            _pcmCount = 0;
+            dcOffset += (tmpBuf[i] - dcOffset) * 0.001f; // seguimiento lento del DC
+            if (warmup)
+                continue; // descartamos, pero el DC ya va convergiendo
+            int16_t centered = (int16_t)(tmpBuf[i] - dcOffset);
+            _pcmBuf[_pcmCount++] = applyGain(centered);
+            if (_pcmCount >= AUDIO_PCM_SAMPLES_PER_CHUNK)
+            {
+                encodeChunk();
+                _pcmCount = 0;
+            }
         }
     }
 #endif
@@ -172,15 +181,25 @@ void AudioSource::loop()
 
 void AudioSource::encodeChunk()
 {
+    // Cola llena: descartamos el mas viejo (el consumidor no esta leyendo,
+    // p. ej. audio OFF). Mejor perder audio viejo que el reciente.
+    if (_qCount == AUDIO_QUEUE_CHUNKS)
+    {
+        _qHead = (_qHead + 1) % AUDIO_QUEUE_CHUNKS;
+        _qCount--;
+        _dropped++;
+    }
+    uint8_t *slot = _queue[(_qHead + _qCount) % AUDIO_QUEUE_CHUNKS];
+
     uint64_t sumSq = 0;
     for (int i = 0; i < AUDIO_CHUNK_SAMPLES; i++)
     {
         int16_t sample = _pcmBuf[i * 2];
-        _ulawBuf[i] = pcm16_to_ulaw(sample);
+        slot[i] = pcm16_to_ulaw(sample);
         sumSq += (int32_t)sample * (int32_t)sample;
     }
     _level = (uint16_t)sqrt((double)(sumSq / AUDIO_CHUNK_SAMPLES));
-    _chunkReady = true;
+    _qCount++;
 }
 
 bool AudioSource::nextAudioChunk(const uint8_t **data, size_t *len)
@@ -210,11 +229,12 @@ bool AudioSource::nextAudioChunk(const uint8_t **data, size_t *len)
 
     return true;
 #else
-    if (!_chunkReady)
+    if (_qCount == 0)
         return false;
-    *data = _ulawBuf;
+    *data = _queue[_qHead];
     *len = AUDIO_CHUNK_SAMPLES;
-    _chunkReady = false;
+    _qHead = (_qHead + 1) % AUDIO_QUEUE_CHUNKS;
+    _qCount--;
     return true;
 #endif
 }

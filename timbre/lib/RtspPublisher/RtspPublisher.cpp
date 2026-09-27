@@ -58,6 +58,16 @@ namespace
 
     uint8_t pkt[MAX_RTP_PACKET + 8];
 
+    // Copia PROPIA del frame que se esta mandando (PSRAM). Antes se mandaba
+    // directo del buffer interno de CameraSource y el task MJPEG (otro core)
+    // lo pisaba a mitad del envio -> JPEG con el final roto en el gateway.
+    uint8_t *frameBuf = nullptr;
+    size_t frameCap = 0;
+
+    // Timestamp RTP de video = tiempo real desde que arranco el stream (90 kHz),
+    // no +1/fps fijo: si el loop va lento, el video no se "acelera".
+    unsigned long streamStartMs = 0;
+
     // Sin credenciales en la URL: van en el header Authorization.
     String rtspUrl()
     {
@@ -305,8 +315,7 @@ namespace
         if ((j.width / 8) > 255 || (j.height / 8) > 255)
             return;
 
-        int fps = videoSrc->videoFps() > 0 ? videoSrc->videoFps() : 10;
-        vTimestamp += 90000 / fps;
+        vTimestamp = (uint32_t)((millis() - streamStartMs) * 90UL);
 
         const uint8_t *scan = jpeg + j.scanStart;
         size_t remaining = j.scanLen;
@@ -435,6 +444,17 @@ namespace RtspPublisher
         vSsrc = esp_random();
         aSsrc = esp_random();
         tcp.setHandshakeTimeout(RTSP_TLS_HANDSHAKE_TIMEOUT_S);
+
+        if (!frameBuf)
+        {
+            frameCap = Config::Media::FRAME_BUF_SIZE;
+            frameBuf = (uint8_t *)(psramFound() ? ps_malloc(frameCap) : malloc(frameCap));
+            if (!frameBuf)
+            {
+                frameCap = 0;
+                Serial.println("[RTSP] sin memoria para el buffer de frame: video deshabilitado");
+            }
+        }
         Serial.printf("[RTSP] configurado -> rtsps://%s:%d (user %s, tls-name %s, video %s, audio %s)\n",
                       mtxHost.c_str(), Config::Media::PORT, user.c_str(),
                       Config::Media::TLS_HOSTNAME,
@@ -446,7 +466,7 @@ namespace RtspPublisher
         mtxPath = path;
         // Negociamos todos los tracks con fuente disponible; el envio arranca
         // apagado y lo prende EventFlow cuando decide (deteccion).
-        hasVideo = (videoSrc != nullptr);
+        hasVideo = (videoSrc != nullptr && frameBuf != nullptr);
         hasAudio = (audioSrc != nullptr);
         videoActivo = false;
         audioActivo = false;
@@ -625,6 +645,7 @@ namespace RtspPublisher
             }
             st = State::Publishing;
             lastFrameMs = 0;
+            streamStartMs = millis();
             Serial.println("[RTSP] LISTO para publicar (negociado: " +
                            String(hasVideo ? "video" : "") +
                            String(hasVideo && hasAudio ? " + " : "") +
@@ -657,21 +678,26 @@ namespace RtspPublisher
                 if (millis() - lastFrameMs >= interval)
                 {
                     lastFrameMs = millis();
-                    const uint8_t *data;
-                    size_t flen;
-                    if (videoSrc->nextVideoFrame(&data, &flen))
-                        sendVideoFrame(data, flen);
+                    size_t flen = 0;
+                    if (videoSrc->copyVideoFrame(frameBuf, frameCap, &flen))
+                        sendVideoFrame(frameBuf, flen);
                 }
             }
 
-            // Audio: manda los chunks disponibles (cada 20ms hay uno). Idem:
-            // negociado Y activado en vivo.
+            // Audio: manda TODOS los chunks encolados (AudioSource acumula lo que
+            // se junto mientras el loop estaba ocupado). Idem: negociado Y
+            // activado en vivo. Tope por vuelta para no monopolizar el loop.
             if (hasAudio && audioActivo && audioSrc)
             {
                 const uint8_t *achunk;
                 size_t alen;
-                if (audioSrc->nextAudioChunk(&achunk, &alen))
+                int sent = 0;
+                while (st == State::Publishing && sent < 64 &&
+                       audioSrc->nextAudioChunk(&achunk, &alen))
+                {
                     sendAudioChunk(achunk, alen);
+                    sent++;
+                }
             }
             break;
         }

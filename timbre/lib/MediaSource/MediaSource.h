@@ -1,5 +1,6 @@
 #pragma once
 #include <Arduino.h>
+#include <string.h>
 
 // ---------------------------------------------------------------------------
 // MediaSource: interfaz de la fuente de media que consume el RtspPublisher.
@@ -27,6 +28,22 @@ public:
     //   len:  tamaño en bytes.
     // Devuelve false si no hay frame disponible en este momento.
     virtual bool nextVideoFrame(const uint8_t **data, size_t *len) = 0;
+
+    // Igual que nextVideoFrame pero COPIA el frame al buffer del caller.
+    // Usar esto cuando el envio es lento (RTSP/TLS): con nextVideoFrame el
+    // buffer interno puede ser pisado por otra captura (task MJPEG en el otro
+    // core) mientras se manda. Default: copia lo que da nextVideoFrame (sirve
+    // para fuentes sin concurrencia, como el mock). CameraSource lo hace bajo mutex.
+    virtual bool copyVideoFrame(uint8_t *dest, size_t destCap, size_t *outLen)
+    {
+        const uint8_t *data = nullptr;
+        size_t len = 0;
+        if (!nextVideoFrame(&data, &len) || len > destCap)
+            return false;
+        memcpy(dest, data, len);
+        *outLen = len;
+        return true;
+    }
 
     // FPS objetivo del video (marca la cadencia con la que el publisher pide).
     virtual int videoFps() const = 0;
