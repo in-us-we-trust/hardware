@@ -11,8 +11,22 @@ namespace
   WiFiClient sseClient;
   bool sseConnected = false;
 
-  String lastText = "";
-  String lastSev = "NORMAL";
+  // --- Estado de la pantalla (para re-enviarlo si la pagina se reconecta) ---
+  // status: linea efimera (progreso / eventos locales).
+  // card:   resultado FIJO. La IA del backend siempre tiene prioridad sobre lo
+  //         local; entre resultados del mismo origen gana el de severidad
+  //         igual o mayor (el peor del evento).
+  struct Resultado
+  {
+    String text;
+    String sev;
+    String src;
+    bool esIA; // true: ia_response del backend. false: tiny model / microfono
+  };
+
+  String lastStatus = "";
+  bool hayCard = false;
+  Resultado card;
 
   void (*hangupCb)() = nullptr;
 
@@ -39,14 +53,18 @@ main{padding:16px 20px;display:flex;flex-direction:column;gap:16px;
 #novideo{color:#6a7080;text-align:center;padding:40px;background:#171a21;
  border-radius:10px;display:none;}
 #viz{width:100%;height:48px;display:block;}
-#log{display:flex;flex-direction:column;gap:8px;}
-.msg{padding:10px 14px;border-radius:8px;background:#171a21;
- border-left:4px solid #3a3f4b;white-space:pre-wrap;}
-.msg .t{font-size:12px;color:#8a90a0;margin-bottom:2px;}
-.sev-HIGH{border-left-color:#e5484d;}
-.sev-MEDIUM{border-left-color:#f5a623;}
-.sev-LOW{border-left-color:#f2d600;}
-.sev-NORMAL{border-left-color:#30a46c;}
+#statusline{font-size:18px;color:#a8aebd;padding:12px 16px;background:#171a21;
+ border-radius:8px;min-height:18px;display:flex;align-items:center;gap:8px;}
+#statusline .dot{width:10px;height:10px;border-radius:50%;background:#6a7080;
+ flex:none;animation:pulse 1.2s ease-in-out infinite;}
+@keyframes pulse{0%,100%{opacity:.3}50%{opacity:1}}
+#card{padding:14px 16px;border-radius:10px;background:#1b1f28;
+ border-left:6px solid #3a3f4b;font-size:17px;font-weight:600;white-space:pre-wrap;}
+#card .t{font-size:12px;color:#8a90a0;font-weight:400;margin-bottom:4px;}
+#card.sev-PELIGROSO{border-left-color:#e5484d;background:#3a1618;}
+#card.sev-SOSPECHOSO{border-left-color:#f5a623;}
+#card.sev-LLAMATIVO{border-left-color:#f2d600;}
+#card.sev-NORMAL{border-left-color:#30a46c;}
 #empty{color:#6a7080;padding:20px;}
 </style></head><body>
 <header>
@@ -54,10 +72,11 @@ main{padding:16px 20px;display:flex;flex-direction:column;gap:16px;
   <button id='hangup'>Colgar</button>
 </header>
 <main>
+  <div id='card'><div id='empty'>Sin analisis todavia</div></div>
   <img id='video' alt='stream'>
   <div id='novideo'>Sin video (timbre en reposo)</div>
   <canvas id='viz' height='48'></canvas>
-  <div id='log'><div id='empty'>Esperando mensajes del gateway...</div></div>
+  <div id='statusline'><span class='dot'></span><span id='statustext'>Timbre en reposo</span></div>
 </main>
 <script>
 var host = location.hostname;
@@ -85,30 +104,31 @@ document.getElementById('hangup').onclick = function(){
   }).catch(function(){});
 };
 
-// --- Mensajes del backend (SSE) ---
-function add(sev,text){
-  var log=document.getElementById('log');
-  var t=new Date().toLocaleTimeString();
-  log.innerHTML='';
-  var d=document.createElement('div'); d.className='msg sev-'+sev;
-  var head=document.createElement('div'); head.className='t';
-  head.textContent=t+' \u00b7 '+sev;
-  var body=document.createElement('div'); body.textContent=text;
-  d.appendChild(head); d.appendChild(body);
-  log.appendChild(d);
+// --- Mensajes (SSE) ---
+// card: resultado fijo arriba del video (lo decide el ESP32: gana el de mayor
+// severidad del evento). status: lo que se esta haciendo, abajo, sin colores.
+function setCard(o){
+  var c=document.getElementById('card');
+  c.className='sev-'+(o.sev||'NORMAL'); c.innerHTML='';
+  var h=document.createElement('div'); h.className='t';
+  h.textContent=new Date().toLocaleTimeString()+' \u00b7 '+(o.src||'')+' \u00b7 '+(o.sev||'NORMAL');
+  var b=document.createElement('div'); b.textContent=o.text||'';
+  c.appendChild(h); c.appendChild(b);
+}
+function setStatus(t){ document.getElementById('statustext').textContent=t; }
+function limpiar(){
+  setStatus('Timbre en reposo');
+  var c=document.getElementById('card'); c.className='';
+  c.innerHTML='<div id="empty">Sin analisis todavia</div>';
 }
 var es=new EventSource('/events');
 es.onmessage=function(e){
   try{
     var o=JSON.parse(e.data);
-    if(o.clear){
-      document.getElementById('log').innerHTML=
-        '<div id="empty">Esperando mensajes del gateway...</div>';
-      targetLevel=0;
-      return;
-    }
+    if(o.clear){ limpiar(); targetLevel=0; return; }
     if(typeof o.level!=='undefined'){ targetLevel=o.level; return; }
-    add(o.sev||'NORMAL', o.text||'');
+    if(o.kind==='status'){ setStatus(o.text||''); return; }
+    if(o.kind==='card'){ setCard(o); return; }
   }catch(err){}
 };
 
@@ -173,13 +193,34 @@ drawViz();
     return o;
   }
 
-  void pushSse(const String &sev, const String &text)
+  void sseSend(const String &json)
   {
     if (sseConnected && sseClient.connected())
-    {
-      sseClient.print("data: {\"sev\":\"" + sev + "\",\"text\":\"" +
-                      escapeJson(text) + "\"}\n\n");
-    }
+      sseClient.print("data: " + json + "\n\n");
+  }
+
+  void pushStatus(const String &text)
+  {
+    sseSend("{\"kind\":\"status\",\"text\":\"" + escapeJson(text) + "\"}");
+  }
+
+  void pushResultado(const char *kind, const Resultado &r)
+  {
+    sseSend(String("{\"kind\":\"") + kind + "\",\"sev\":\"" + escapeJson(r.sev) +
+            "\",\"src\":\"" + escapeJson(r.src) + "\",\"text\":\"" +
+            escapeJson(r.text) + "\"}");
+  }
+
+  // NORMAL < LLAMATIVO < SOSPECHOSO < PELIGROSO (mismo orden que el backend).
+  int rango(const String &sev)
+  {
+    if (sev == "PELIGROSO")
+      return 3;
+    if (sev == "SOSPECHOSO")
+      return 2;
+    if (sev == "LLAMATIVO")
+      return 1;
+    return 0;
   }
 
   void handleRoot()
@@ -198,8 +239,11 @@ drawViz();
         "Connection: keep-alive\r\n"
         "Access-Control-Allow-Origin: *\r\n"
         "\r\n");
-    if (lastText.length() > 0)
-      pushSse(lastSev, lastText);
+    // La pagina pudo recargarse a mitad de evento: le re-mandamos todo.
+    if (hayCard)
+      pushResultado("card", card);
+    if (lastStatus.length() > 0)
+      pushStatus(lastStatus);
   }
 
   void handleHangup()
@@ -239,22 +283,43 @@ namespace Screen
     sseConnected = false;
   }
 
-  void showMessage(const String &text, const String &severity)
+  void showStatus(const String &text)
   {
-    lastText = text;
-    lastSev = severity.length() ? severity : "NORMAL";
-    Serial.printf("[SCREEN] %s | %s\n", lastSev.c_str(), text.c_str());
-    pushSse(lastSev, text);
+    lastStatus = text;
+    Serial.printf("[SCREEN] estado | %s\n", text.c_str());
+    pushStatus(text);
+  }
+
+  void showResult(const String &text, const String &severity, const String &source, bool esIA)
+  {
+    Resultado r{text, severity.length() ? severity : String("NORMAL"), source, esIA};
+
+    // Tarjeta fija:
+    //  - IA sobre local: siempre reemplaza (aunque sea de menor severidad).
+    //  - local sobre IA: nunca.
+    //  - mismo origen: solo si es igual o peor que la actual.
+    bool fija;
+    if (!hayCard)
+      fija = true;
+    else if (r.esIA != card.esIA)
+      fija = r.esIA;
+    else
+      fija = rango(r.sev) >= rango(card.sev);
+    if (fija)
+    {
+      card = r;
+      hayCard = true;
+      pushResultado("card", r);
+    }
+    Serial.printf("[SCREEN] resultado%s | %s | %s | %s\n", fija ? " (FIJO)" : "",
+                  r.sev.c_str(), r.src.c_str(), r.text.c_str());
   }
 
   void clear()
   {
-    lastText = "";
-    lastSev = "NORMAL";
-    if (sseConnected && sseClient.connected())
-    {
-      sseClient.print("data: {\"clear\":true}\n\n");
-    }
+    lastStatus = "";
+    hayCard = false;
+    sseSend("{\"clear\":true}");
     Serial.println("[SCREEN] limpio mensajes");
   }
 

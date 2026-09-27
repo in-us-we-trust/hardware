@@ -114,6 +114,19 @@ namespace BackendSession
         return true;
     }
 
+    bool enviarCaptura(const String &id, const uint8_t *jpeg, size_t len)
+    {
+        if (!active || id != trackId)
+            return false;
+        String fotoB64 = toBase64(jpeg, len);
+        if (fotoB64.length() == 0)
+        {
+            Serial.println("[SESSION] no se pudo codificar la captura");
+            return false;
+        }
+        return MqttClient::publishCaptureImage(trackId, fotoB64);
+    }
+
     bool iniciarMedia(const String &id)
     {
         // Path que el gateway reconstruye: {RTSP_BASE}/{deviceId}/doorbell/{trackId}.
@@ -123,6 +136,17 @@ namespace BackendSession
         if (!ok)
             Serial.println("[SESSION] RTSP no arranco (el evento local sigue)");
         return ok;
+    }
+
+    void avisarInicioMedia(const String &id)
+    {
+        MqttClient::publishStreamStart(id);
+    }
+
+    void detenerMedia()
+    {
+        if (RtspPublisher::state() != RtspPublisher::State::Idle)
+            RtspPublisher::stop();
     }
 
     bool mediaLista()

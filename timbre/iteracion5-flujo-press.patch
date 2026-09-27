@@ -1,0 +1,988 @@
+diff --git a/timbre/lib/BackendSession/BackendSession.cpp b/timbre/lib/BackendSession/BackendSession.cpp
+index e4a9cbb..2dedd60 100644
+--- a/timbre/lib/BackendSession/BackendSession.cpp
++++ b/timbre/lib/BackendSession/BackendSession.cpp
+@@ -125,6 +125,17 @@ namespace BackendSession
+         return ok;
+     }
+ 
++    void avisarInicioMedia(const String &id)
++    {
++        MqttClient::publishStreamStart(id);
++    }
++
++    void detenerMedia()
++    {
++        if (RtspPublisher::state() != RtspPublisher::State::Idle)
++            RtspPublisher::stop();
++    }
++
+     bool mediaLista()
+     {
+         return RtspPublisher::isPublishing();
+diff --git a/timbre/lib/BackendSession/BackendSession.h b/timbre/lib/BackendSession/BackendSession.h
+index 9c16316..620c6cb 100644
+--- a/timbre/lib/BackendSession/BackendSession.h
++++ b/timbre/lib/BackendSession/BackendSession.h
+@@ -53,10 +53,10 @@ namespace BackendSession
+ 
+     // Arranca el stream RTSPS hacia MediaMTX en {deviceId}/doorbell/{trackId}.
+     // Negocia todos los tracks con fuente, pero NO envia nada todavia.
+-    // Contrato: el path tiene que estar READY ANTES del press (si no, el PLAY
+-    // del gateway da 404). Por eso EventFlow lo llama antes de enviarFoto y
+-    // espera mediaLista(). El audio y el video van por RTSP y el gateway los
+-    // extrae en chunks. Devuelve true si arranco la negociacion (TLS OK).
++    // Se abre DESPUES del press, solo si hay persona o sonido; al quedar ready
++    // se avisa con avisarInicioMedia() (stream_start). El audio y el video van
++    // por RTSP y el gateway los extrae en chunks. Devuelve true si arranco la
++    // negociacion (TLS OK).
+     bool iniciarMedia(const String &trackId);
+ 
+     // true cuando MediaMTX acepto el RECORD (path ready para el PLAY del gateway).
+@@ -65,6 +65,14 @@ namespace BackendSession
+     // true si la negociacion RTSP fallo (TLS, 401, SETUP...).
+     bool mediaFallo();
+ 
++    // Publica stream_start: el RTSP de trackId ya esta publicando y el gateway
++    // puede hacer PLAY. Se llama cuando mediaLista() da true.
++    void avisarInicioMedia(const String &trackId);
++
++    // Frena el RTSP sin cerrar la sesion MQTT (no publica stream_end). Para
++    // cuando la negociacion falla y se vuelve al analisis local.
++    void detenerMedia();
++
+     // Prende/apaga el envio de cada track EN VIVO (sin reconectar). Lo llama
+     // EventFlow segun su deteccion: audio cuando hay sonido, video cuando el
+     // tiny model ve una persona.
+diff --git a/timbre/lib/Config/Config.h b/timbre/lib/Config/Config.h
+index 38a18bc..82a41c1 100644
+--- a/timbre/lib/Config/Config.h
++++ b/timbre/lib/Config/Config.h
+@@ -149,14 +149,23 @@ namespace Config
+     namespace Event
+     {
+         constexpr uint32_t BACKEND_CONNECT_TIMEOUT_MS = 10000;
++        // Espera tras prender la camara antes de sacar la foto del press (los
++        // primeros frames salen oscuros).
++        constexpr uint32_t FOTO_WARMUP_MS = 1000;
++        // El ia_response de la IMAGE del press se espera SIEMPRE (sin timeout).
++        // Si el press no se pudo publicar, se reintenta cada PRESS_RETRY_MS.
++        constexpr uint32_t PRESS_RETRY_MS = 2000;
++        // Mensajes de "progreso" en la Screen: solo salen si la pantalla estuvo
++        // quieta este tiempo (no pisan enseguida un resultado de la IA).
++        constexpr uint32_t PROGRESO_ESPERA_MS = 2500; // esperando la respuesta del press
++        constexpr uint32_t PROGRESO_SESION_MS = 6000; // monitoreo / sesion en vivo
+         // Cuanto esperar a que el RTSPS quede ready (TLS + ANNOUNCE/SETUP/RECORD)
+-        // antes de mandar el press igual (solo IMAGE).
++        // antes de desistir y volver al analisis local.
+         constexpr uint32_t RTSP_READY_TIMEOUT_MS = 8000;
+         constexpr uint32_t AUDIO_LEVEL_THROTTLE_MS = 120; // push nivel a Screen
+ 
+-        // Con el stream local ya corriendo, cada cuanto se re-evalua si hay
+-        // motivo (sonido o persona) para CONECTAR al backend. El primer chequeo
+-        // cae un intervalo despues del timbre, lo que da warm-up a camara/mic.
++        // Sin media abierta (SIN_MEDIA): cada cuanto se re-analiza localmente
++        // (tiny model + nivel de mic) si hay motivo para abrir el RTSP.
+         constexpr uint32_t EVAL_INTERVAL_MS = 1000;
+ 
+         // Cada cuanto EventFlow re-evalua que mandar por RTSP. Audio y video
+diff --git a/timbre/lib/EventFlow/EventFlow.cpp b/timbre/lib/EventFlow/EventFlow.cpp
+index 8ca6ae4..4f10493 100644
+--- a/timbre/lib/EventFlow/EventFlow.cpp
++++ b/timbre/lib/EventFlow/EventFlow.cpp
+@@ -17,29 +17,52 @@
+ //
+ // Dos caminos EN PARALELO al tocar el timbre:
+ //   LOCAL:   MJPEG task en core 0 (:8081), Screen en core 1 (:80)
+-//   BACKEND: MQTT press + RTSP video+audio hacia MediaMTX
++//   BACKEND: MQTT press (foto) y, solo si hace falta, RTSP video+audio
++//
++// Flujo del BACKEND:
++//   1. ANALIZANDO_FOTO  foto del timbre -> tiny model (persona si/no).
++//   2. CONECTANDO       MQTT (mTLS).
++//   3. ESPERANDO_IA     press con la foto (SIEMPRE, haya o no persona) y se
++//                       espera el ia_response de esa IMAGE (siempre, sin timeout).
++//   4. SIN_MEDIA        no hubo persona ni sonido: se siguen sacando fotos y
++//                       analizando LOCALMENTE (sin volver a mandar el press).
++//   5. ABRIENDO_MEDIA   hubo persona o sonido: se abre el RTSPS.
++//   6. EN_SESION        RTSP publicando + stream_start avisado al gateway.
++//   FINALIZADO          STOP_DANGER: no se vuelve a abrir backend en este evento.
++//
++// Screen: linea de ESTADO (cada paso + mensajes "de progreso" rotativos para
++// que el usuario vea que el analisis sigue) y RESULTADOS (IA y locales) con
++// una tarjeta fija que muestra el de mayor severidad del evento.
+ // ---------------------------------------------------------------------------
+ 
+ namespace
+ {
+     enum class Backend
+     {
+-        OFF,            // sin sesion de backend: con evento activo, re-evalua cada
+-                        // EVAL_INTERVAL_MS si hay motivo (sonido/persona) para conectar
+-        CONECTANDO,     // conectando al broker MQTT
+-        ABRIENDO_MEDIA, // MQTT listo; negociando RTSPS (tiene que quedar ready ANTES del press)
+-        EN_SESION       // press enviado, publicando media
++        OFF,             // sin evento
++        ANALIZANDO_FOTO, // warm-up de la camara; despues foto + tiny model
++        CONECTANDO,      // conectando al broker MQTT
++        ESPERANDO_IA,    // press enviado; esperando el ia_response de la IMAGE
++        SIN_MEDIA,       // sin persona ni sonido: analisis local, sin RTSP
++        ABRIENDO_MEDIA,  // negociando RTSPS
++        EN_SESION,       // RTSP publicando (stream_start enviado)
++        FINALIZADO       // STOP_DANGER: backend cerrado para este evento
+     };
+ 
+     MediaSource *src = nullptr;
+ 
+     bool eventoActivo = false;
+     Backend backend = Backend::OFF;
+-    unsigned long conectandoDesde = 0;
+-    unsigned long mediaDesde = 0;
++    unsigned long estadoDesde = 0;       // cuando se entro al estado actual
+     unsigned long ultimaEvaluacionMs = 0;
+     String trackId = "";
+ 
++    // Resultado del tiny model sobre la foto del press.
++    bool personaEnFoto = false;
++    // Llego el ia_response de la IMAGE del press (lo marca onRespuesta).
++    bool respuestaImagen = false;
++    bool reintentandoPress = false;
++
+     // Pico del nivel de microfono desde la ultima vez que se evaluo. level() es
+     // solo el RMS del ultimo chunk (20ms): si se lee cada 1s, un sonido corto
+     // entre chequeos se pierde. loop() va acumulando el maximo y haySonido()
+@@ -160,20 +183,103 @@ namespace
+         }
+     }
+ 
++    // --- Screen ---------------------------------------------------------------
++    // Dos zonas:
++    //   estado():    linea efimera (progreso, conexion, fallas). Se pisa sola.
++    //   resultado(): analisis de la IA del backend o del tiny model / microfono
++    //                local. Va al historial y a la tarjeta fija (Screen decide:
++    //                gana el de mayor severidad del evento).
++    // Los mensajes de progreso solo salen si la linea de estado estuvo quieta
++    // un rato, asi no pisan enseguida un estado recien puesto.
++    unsigned long ultimoMensajeMs = 0;
++    uint8_t pasoProgreso = 0;
++
++    void estado(const String &texto)
++    {
++        Screen::showStatus(texto);
++        ultimoMensajeMs = millis();
++    }
++
++    void resultado(const String &texto, const String &severidad, const String &origen)
++    {
++        Screen::showResult(texto, severidad, origen);
++    }
++
++    const char *const ORIGEN_CAMARA = "Local - Camara";
++    const char *const ORIGEN_MICROFONO = "Local - Microfono";
++
++    void cambiarEstado(Backend nuevo)
++    {
++        backend = nuevo;
++        estadoDesde = millis();
++        pasoProgreso = 0;
++    }
++
++    // Muestra el siguiente mensaje de la lista si la pantalla estuvo quieta
++    // al menos cadaMs. Da la sensacion de un analisis continuo.
++    void progreso(const char *const *mensajes, size_t cantidad, uint32_t cadaMs)
++    {
++        if (cantidad == 0 || millis() - ultimoMensajeMs < cadaMs)
++            return;
++        estado(mensajes[pasoProgreso % cantidad]);
++        pasoProgreso++;
++    }
++
++    const char *const PROGRESO_CON_PERSONA[] = {
++        "Reconociendo a la persona en la imagen...",
++        "Comparando el rostro con las personas registradas...",
++        "Buscando objetos peligrosos en la imagen...",
++    };
++    const char *const PROGRESO_SIN_PERSONA[] = {
++        "Buscando objetos peligrosos en la imagen...",
++        "Analizando la escena frente a la puerta...",
++        "Verificando si hay alguien en la imagen...",
++    };
++    const char *const PROGRESO_MONITOREO[] = {
++        "Sin personas a la vista. Sigo monitoreando la entrada...",
++        "Analizando la camara en busca de movimiento...",
++        "Escuchando el entorno del timbre...",
++    };
++    const char *const PROGRESO_VIDEO[] = {
++        "Analizando el comportamiento en video...",
++        "Buscando objetos peligrosos en el video...",
++        "Siguiendo el movimiento frente a la puerta...",
++    };
++    const char *const PROGRESO_AUDIO[] = {
++        "Analizando la conversacion...",
++        "Buscando senales de presion o amenaza en el audio...",
++    };
++    const char *const PROGRESO_AUDIO_VIDEO[] = {
++        "Analizando el comportamiento en video...",
++        "Analizando la conversacion...",
++        "Buscando objetos peligrosos en el video...",
++        "Buscando senales de presion o amenaza en el audio...",
++    };
++
++    template <size_t N>
++    void progreso(const char *const (&mensajes)[N], uint32_t cadaMs)
++    {
++        progreso(mensajes, N, cadaMs);
++    }
++
+     void endEvent()
+     {
+         Serial.println("[FLOW] hangup local -> cierro el evento");
+-        Screen::showMessage("Finalizando llamada...");
+-        // cerrarSesion frena el RTSP y publica stream_end (ambos los maneja
+-        // BackendSession).
+-        if (backend != Backend::OFF || BackendSession::haySesionActiva())
++        estado("Finalizando llamada...");
++        // cerrarSesion frena el RTSP (si estaba) y publica stream_end (si hubo
++        // press). Se llama siempre: el gateway necesita el stream_end para
++        // dejar de reintentar el RTSP aunque nunca se haya abierto.
++        if (backend != Backend::OFF)
+             BackendSession::cerrarSesion(trackId);
+ 
+-        backend = Backend::OFF;
++        cambiarEstado(Backend::OFF);
+         audioDetectado = false;
+         videoDetectado = false;
+         fotoSinAnalizar = false;
+         fotoLen = 0;
++        personaEnFoto = false;
++        respuestaImagen = false;
++        reintentandoPress = false;
+ 
+         stopMjpegTask();
+         Microphone.end();
+@@ -183,8 +289,8 @@ namespace
+         PowerMode::low(); // camara off + 80MHz + WiFi sleep
+     }
+ 
+-    // VIDEO: corre el tiny model (PersonDetector) sobre la foto del timbre si
+-    // todavia no se analizo; si no, sobre un frame nuevo.
++    // VIDEO: corre el tiny model sobre la foto del timbre si todavia no se
++    // analizo; si no, sobre un frame nuevo.
+     bool hayPersonaEnFrame()
+     {
+         if (fotoSinAnalizar)
+@@ -206,23 +312,41 @@ namespace
+         return pico >= Config::Event::AUDIO_ACTIVATE_LEVEL;
+     }
+ 
++    String etiquetaChunk(const String &chunkType)
++    {
++        if (chunkType == "IMAGE")
++            return "Imagen";
++        if (chunkType == "VIDEO")
++            return "Video";
++        if (chunkType == "AUDIO")
++            return "Audio";
++        return chunkType;
++    }
++
+     void mostrarEnScreen(const MqttClient::IaResponse &r)
+     {
+-        String text = "[" + r.chunkType + "] " + r.action;
+-        if (r.message.length() > 0)
+-            text += " \u2014 " + r.message;
+-        Screen::showMessage(text, r.severity);
++        String texto = r.message.length() > 0 ? r.message : String("Analisis completado");
++        String sev = r.severity;
++        if (r.isStopDanger())
++        {
++            texto = "PELIGRO: " + texto;
++            sev = "PELIGROSO"; // un STOP_DANGER siempre queda fijo arriba
++        }
++        resultado(texto, sev, "IA - " + etiquetaChunk(r.chunkType));
+     }
+ 
+     void onRespuesta(const MqttClient::IaResponse &r)
+     {
+         mostrarEnScreen(r);
+ 
++        if (r.chunkType == "IMAGE")
++            respuestaImagen = true;
++
+         if (r.isStopDanger())
+         {
+             Serial.println("[FLOW] STOP_DANGER -> cierro SOLO el backend (el stream local sigue)");
+             BackendSession::cerrarSesion(trackId); // frena RTSP + stream_end
+-            backend = Backend::OFF;
++            cambiarEstado(Backend::FINALIZADO);
+         }
+         else
+         {
+@@ -233,22 +357,42 @@ namespace
+ 
+ namespace
+ {
+-    // Publica el press (con la foto) y pasa a EN_SESION. Se llama con el RTSP
+-    // ya ready o, si el RTSP fallo, igual: el gateway analiza al menos la IMAGE.
+-    void enviarPress()
++    // Publica el press con la foto analizada. Mensaje en pantalla segun lo que
++    // dijo el tiny model, para que el usuario sepa que se esta analizando.
++    bool enviarPress()
+     {
+         // Si todavia no hay foto (fallo la del timbre), sacamos una ahora.
+         if (fotoLen == 0)
+             capturarFoto();
+         if (!BackendSession::enviarFotoBase64(trackId, CameraSource::toBase64(foto, fotoLen)))
+         {
+-            Serial.println("[FLOW] fallo el press: backend OFF, sigo evaluando (el evento local sigue)");
+-            BackendSession::cerrarSesion(trackId); // frena el RTSP si habia quedado abierto
+-            backend = Backend::OFF;
+-            return;
++            Serial.println("[FLOW] fallo el press");
++            return false;
+         }
+-        Serial.printf("[FLOW] sesion de backend iniciada trackId=%s\n", trackId.c_str());
+-        backend = Backend::EN_SESION;
++        Serial.printf("[FLOW] press enviado trackId=%s (persona local=%s)\n",
++                      trackId.c_str(), personaEnFoto ? "si" : "no");
++        estado(personaEnFoto ? "Reconociendo a la persona en la imagen..."
++                             : "Buscando objetos peligrosos en la imagen...");
++        return true;
++    }
++
++    // Abre el RTSP si hubo persona o sonido. Si no, analisis local.
++    void decidirMedia()
++    {
++        if (videoDetectado || audioDetectado)
++        {
++            estado(videoDetectado ? "Iniciando video para analisis en vivo..."
++                                  : "Iniciando audio para analisis en vivo...");
++            if (BackendSession::iniciarMedia(trackId))
++            {
++                cambiarEstado(Backend::ABRIENDO_MEDIA);
++                return;
++            }
++            Serial.println("[FLOW] RTSP no arranco: sigo con analisis local");
++        }
++        estado("Sin personas a la vista. Sigo monitoreando la entrada...");
++        cambiarEstado(Backend::SIN_MEDIA);
++        ultimaEvaluacionMs = millis();
+     }
+ }
+ 
+@@ -268,7 +412,7 @@ namespace EventFlow
+         Screen::onHangup(EventFlow::terminar);
+ 
+         eventoActivo = false;
+-        backend = Backend::OFF;
++        cambiarEstado(Backend::OFF);
+         Serial.println("[FLOW] EventFlow listo (IDLE)");
+     }
+ 
+@@ -287,21 +431,24 @@ namespace EventFlow
+         PowerMode::high(); // CPU full + WiFi sin sleep + camara on
+         Microphone.begin();
+ 
+-        // Foto del timbre: se saca ya y es la primera que analiza el tiny model.
+-        fotoSinAnalizar = capturarFoto();
+-
+         // Alimenta el visor que ve el usuario. Es un task que funciona en el 2do core
+         startMjpegTask();
+         hangupPedido = false;
+         eventoActivo = true;
+ 
+-        // El stream local ya corre. NO conectamos al backend todavia: con el
+-        // backend en OFF, loop() re-chequea cada EVAL_INTERVAL_MS si hay motivo
+-        // (sonido o persona) para conectar. El primer chequeo cae un intervalo
+-        // despues, lo que le da warm-up a la camara y el microfono.
+-        backend = Backend::OFF;
+-        ultimaEvaluacionMs = millis();
++        audioDetectado = false;
++        videoDetectado = false;
++        personaEnFoto = false;
++        respuestaImagen = false;
++        reintentandoPress = false;
+         picoAudio = 0;
++        fotoLen = 0;
++        fotoSinAnalizar = false;
++
++        estado("Tocaron el timbre. Analizando la imagen...");
++        // La foto se saca despues de FOTO_WARMUP_MS (la camara recien prendida
++        // da frames oscuros).
++        cambiarEstado(Backend::ANALIZANDO_FOTO);
+     }
+ 
+     void terminar()
+@@ -330,46 +477,136 @@ namespace EventFlow
+             }
+         }
+ 
+-        // Evento activo sin backend (recien tocado, timeout, fallo del press o
+-        // STOP_DANGER): cada EVAL_INTERVAL_MS analiza frame y audio; con una
+-        // sola deteccion positiva, conecta. Si nunca hay motivo, se queda solo
+-        // con el stream local hasta el hangup.
+-        if (eventoActivo && backend == Backend::OFF)
++        switch (backend)
+         {
++        case Backend::OFF:
++        case Backend::FINALIZADO:
++            break;
++
++        case Backend::ANALIZANDO_FOTO:
++            if (millis() - estadoDesde >= Config::Event::FOTO_WARMUP_MS)
++            {
++                // 1) foto + tiny model
++                fotoSinAnalizar = capturarFoto();
++                personaEnFoto = hayPersonaEnFrame();
++                videoDetectado = personaEnFoto;
++                audioDetectado = haySonido();
++                // Resultado LOCAL (tiny model / microfono): va a la tarjeta
++                // hasta que llegue algo de la IA.
++                resultado(personaEnFoto ? "Persona detectada en la puerta"
++                                        : "No se ve a nadie en la imagen",
++                          "NORMAL", ORIGEN_CAMARA);
++                if (audioDetectado)
++                    resultado("Se escucha a alguien en la puerta", "NORMAL", ORIGEN_MICROFONO);
++                estado("Enviando la imagen para analizarla...");
++                // 2) conectar para mandar el press (siempre, haya o no persona)
++                BackendSession::conectar();
++                cambiarEstado(Backend::CONECTANDO);
++            }
++            break;
++
++        case Backend::CONECTANDO:
++            if (BackendSession::estaListo())
++            {
++                // Tras un press fallido, espera un poco antes de reintentar.
++                if (reintentandoPress && millis() - estadoDesde < Config::Event::PRESS_RETRY_MS)
++                    break;
++                if (enviarPress())
++                {
++                    reintentandoPress = false;
++                    cambiarEstado(Backend::ESPERANDO_IA);
++                }
++                else
++                {
++                    // Siempre se espera la respuesta del press: sin press no
++                    // se sigue, se reintenta.
++                    estado("No se pudo enviar la imagen. Reintentando...");
++                    reintentandoPress = true;
++                    BackendSession::conectar();
++                    cambiarEstado(Backend::CONECTANDO);
++                }
++            }
++            else if (millis() - estadoDesde > Config::Event::BACKEND_CONNECT_TIMEOUT_MS)
++            {
++                Serial.println("[FLOW] timeout conectando backend: reintento");
++                estado("Sin conexion con el servicio de analisis. Reintentando...");
++                BackendSession::conectar();
++                cambiarEstado(Backend::CONECTANDO);
++            }
++            break;
++
++        case Backend::ESPERANDO_IA:
++            // Mientras llega la respuesta, se sigue escuchando: si aparece
++            // sonido, cuenta para abrir el audio despues.
++            if (!audioDetectado && haySonido())
++                audioDetectado = true;
++
++            // Se espera SIEMPRE la respuesta de la IMAGE (sin timeout): recien
++            // con ella se decide si abrir el stream.
++            if (respuestaImagen)
++            {
++                decidirMedia();
++            }
++            else if (personaEnFoto)
++            {
++                progreso(PROGRESO_CON_PERSONA, Config::Event::PROGRESO_ESPERA_MS);
++            }
++            else
++            {
++                progreso(PROGRESO_SIN_PERSONA, Config::Event::PROGRESO_ESPERA_MS);
++            }
++            break;
++
++        case Backend::SIN_MEDIA:
++            // Analisis LOCAL cada EVAL_INTERVAL_MS. No se vuelve a mandar el press.
+             if (millis() - ultimaEvaluacionMs >= Config::Event::EVAL_INTERVAL_MS)
+             {
+                 ultimaEvaluacionMs = millis();
+-                // Evaluamos las dos (sin cortocircuito) para avisar cada deteccion en la Screen
+                 bool sonido = haySonido();
+                 bool persona = hayPersonaEnFrame();
+-
+-                if (sonido && persona)
+-                    Screen::showMessage("Persona y audio detectada en el timbre. Analizando analisis inteligente...");
+-                else if (sonido)
+-                    Screen::showMessage("Audio entrante detectada en el timbre");
+-                else if (persona)
+-                    Screen::showMessage("Persona detectada en el timbre");
+-                if (sonido || persona)
++                if (persona || sonido)
+                 {
+-                    // Lo detectado queda prendido toda la sesion; en EN_SESION
+-                    // solo se sigue chequeando lo que falta.
+-                    audioDetectado = sonido;
+                     videoDetectado = persona;
+-                    BackendSession::conectar();
+-                    conectandoDesde = millis();
+-                    backend = Backend::CONECTANDO;
+-                }
+-                else
+-                {
+-                    Screen::showMessage("No se detecta presencia en el timbre");
++                    audioDetectado = sonido;
++                    if (persona)
++                        resultado("Persona detectada en la puerta", "NORMAL", ORIGEN_CAMARA);
++                    if (sonido)
++                        resultado("Se escucha a alguien en la puerta", "NORMAL", ORIGEN_MICROFONO);
++                    decidirMedia();
++                    break;
+                 }
+             }
+-        }
++            progreso(PROGRESO_MONITOREO, Config::Event::PROGRESO_SESION_MS);
++            break;
++
++        case Backend::ABRIENDO_MEDIA:
++            if (BackendSession::mediaLista())
++            {
++                BackendSession::activarAudio(audioDetectado);
++                BackendSession::activarVideo(videoDetectado);
++                BackendSession::avisarInicioMedia(trackId); // stream_start
++                Serial.println("[FLOW] RTSP ready -> stream_start");
++                estado(videoDetectado && audioDetectado
++                            ? "Transmitiendo video y audio. Analisis en vivo en curso..."
++                        : videoDetectado ? "Transmitiendo video. Analisis en vivo en curso..."
++                                         : "Transmitiendo audio. Analisis en vivo en curso...");
++                cambiarEstado(Backend::EN_SESION);
++            }
++            else if (BackendSession::mediaFallo() ||
++                     millis() - estadoDesde > Config::Event::RTSP_READY_TIMEOUT_MS)
++            {
++                Serial.println("[FLOW] RTSP no quedo ready: vuelvo al analisis local");
++                BackendSession::detenerMedia();
++                estado("No se pudo iniciar la transmision. Sigo monitoreando...");
++                cambiarEstado(Backend::SIN_MEDIA);
++                ultimaEvaluacionMs = millis();
++            }
++            break;
+ 
+-        // En sesion, lo ya detectado no se re-analiza: solo se chequea lo que
+-        // falta y, al detectarlo, se prende y queda prendido.
+-        if (backend == Backend::EN_SESION)
++        case Backend::EN_SESION:
+         {
++            // Lo ya detectado no se re-analiza: solo se chequea lo que falta y,
++            // al detectarlo, se prende y queda prendido.
+             static unsigned long lastAudioDetectMs = 0;
+             if (!audioDetectado &&
+                 millis() - lastAudioDetectMs >= Config::Event::AUDIO_DETECT_INTERVAL_MS)
+@@ -378,9 +615,8 @@ namespace EventFlow
+                 if (haySonido())
+                 {
+                     audioDetectado = true;
+-                    Screen::showMessage(videoDetectado
+-                                            ? "Persona y audio detectada en el timbre. Analizando analisis inteligente..."
+-                                            : "Audio entrante detectada en el timbre");
++                    resultado("Se escucha a alguien en la puerta", "NORMAL", ORIGEN_MICROFONO);
++                    estado("Analizando la conversacion...");
+                     BackendSession::activarAudio(true);
+                 }
+             }
+@@ -393,57 +629,20 @@ namespace EventFlow
+                 if (hayPersonaEnFrame())
+                 {
+                     videoDetectado = true;
+-                    Screen::showMessage(audioDetectado
+-                                            ? "Persona y audio detectada en el timbre. Analizando analisis inteligente..."
+-                                            : "Persona detectada en el timbre");
+-                    // BackendSession::activarVideo(true);
++                    resultado("Persona detectada en la puerta", "NORMAL", ORIGEN_CAMARA);
++                    estado("Iniciando analisis de video...");
++                    BackendSession::activarVideo(true);
+                 }
+             }
+-        }
+ 
+-        if (backend == Backend::CONECTANDO)
+-        {
+-            if (BackendSession::estaListo())
+-            {
+-                // Contrato: el path RTSP tiene que estar ready ANTES del press
+-                // (si no, el PLAY del gateway da 404 y no hay VIDEO/AUDIO).
+-                if (BackendSession::iniciarMedia(trackId))
+-                {
+-                    mediaDesde = millis();
+-                    backend = Backend::ABRIENDO_MEDIA;
+-                }
+-                else
+-                {
+-                    Serial.println("[FLOW] RTSP no arranco: mando el press igual (solo IMAGE)");
+-                    enviarPress();
+-                }
+-            }
+-            else if (millis() - conectandoDesde > Config::Event::BACKEND_CONNECT_TIMEOUT_MS)
+-            {
+-                Serial.println("[FLOW] timeout conectando backend: backend OFF, sigo evaluando (sigue el local)");
+-                backend = Backend::OFF;
+-            }
++            if (videoDetectado && audioDetectado)
++                progreso(PROGRESO_AUDIO_VIDEO, Config::Event::PROGRESO_SESION_MS);
++            else if (videoDetectado)
++                progreso(PROGRESO_VIDEO, Config::Event::PROGRESO_SESION_MS);
++            else
++                progreso(PROGRESO_AUDIO, Config::Event::PROGRESO_SESION_MS);
++            break;
+         }
+-
+-        if (backend == Backend::ABRIENDO_MEDIA)
+-        {
+-            if (BackendSession::mediaLista())
+-            {
+-                // Prender lo detectado ANTES del press: el gateway hace PLAY
+-                // enseguida y MediaMTX corta al publisher que no manda datos en
+-                // 10 s. Lo que falta lo prende loop() (EN_SESION) al detectarlo.
+-                BackendSession::activarAudio(audioDetectado);
+-                BackendSession::activarVideo(videoDetectado);
+-                Serial.println("[FLOW] RTSP ready -> mando el press");
+-                enviarPress();
+-            }
+-            else if (BackendSession::mediaFallo() ||
+-                     millis() - mediaDesde > Config::Event::RTSP_READY_TIMEOUT_MS)
+-            {
+-                Serial.println("[FLOW] RTSP no quedo ready: mando el press igual (solo IMAGE)");
+-                BackendSession::cerrarSesion(trackId); // frena el RTSP a medio negociar
+-                enviarPress();
+-            }
+         }
+ 
+         if (hangupPedido)
+diff --git a/timbre/lib/MqttClient/MqttClient.cpp b/timbre/lib/MqttClient/MqttClient.cpp
+index 0449432..1965246 100644
+--- a/timbre/lib/MqttClient/MqttClient.cpp
++++ b/timbre/lib/MqttClient/MqttClient.cpp
+@@ -46,6 +46,7 @@ namespace
+ {
+     const char *ACTION_PRESS = "press";
+     const char *ACTION_STREAM_END = "stream_end";
++    const char *ACTION_STREAM_START = "stream_start";
+     const char *ACTION_CAPTURE_IMAGE = "capture_image";
+     const char *ACTION_CAPTURE_AUDIO = "capture_audio";
+     const char *ACTION_IA_RESPONSE = "ia_response";
+@@ -360,6 +361,15 @@ namespace MqttClient
+         return publishJson(topic, doc);
+     }
+ 
++    bool publishStreamStart(const String &trackId)
++    {
++        JsonDocument doc;
++        addTimestamp(doc);
++        String topic = topicFor(trackId, ACTION_STREAM_START);
++        Serial.printf("[MQTT] -> %s\n", topic.c_str());
++        return publishJson(topic, doc);
++    }
++
+     bool publishCaptureImage(const String &trackId)
+     {
+         JsonDocument doc;
+diff --git a/timbre/lib/MqttClient/MqttClient.h b/timbre/lib/MqttClient/MqttClient.h
+index 65080c4..a2c0633 100644
+--- a/timbre/lib/MqttClient/MqttClient.h
++++ b/timbre/lib/MqttClient/MqttClient.h
+@@ -15,6 +15,7 @@
+ // Topicos (la identidad va SOLO en el topico, nunca en el JSON):
+ //   Publica (QoS 1, sin retain):
+ //     home/{deviceId}/events/{trackId}/press
++//     home/{deviceId}/events/{trackId}/stream_start  (RTSP publicando; ver abajo)
+ //     home/{deviceId}/events/{trackId}/stream_end
+ //     home/{deviceId}/events/{trackId}/capture_image   (opcional)
+ //     home/{deviceId}/events/{trackId}/capture_audio   (opcional)
+@@ -26,6 +27,8 @@
+ // Payloads (JSON compacto UTF-8):
+ //   press:       {"event":"press","timestamp":<ms>,"image":"<b64>","batteryPercentage":<f>}
+ //                timestamp/image/batteryPercentage son opcionales.
++//   stream_start:{"timestamp":<ms>}  el RTSP de este trackId ya esta publicando.
++//                (El press ya NO implica RTSP: se abre solo si hay persona/sonido.)
+ //   stream_end:  {"timestamp":<ms>}
+ //   capture_*:   {"timestamp":<ms>}
+ //   ia_response (entrada):
+@@ -96,6 +99,9 @@ namespace MqttClient
+                       const String &imageBase64 = "",
+                       float batteryPercentage = NAN);
+ 
++    // stream_start: el RTSP de trackId esta publicando (el gateway puede PLAY).
++    bool publishStreamStart(const String &trackId);
++
+     // stream_end: cierre de la llamada trackId.
+     bool publishStreamEnd(const String &trackId);
+ 
+diff --git a/timbre/lib/Screen/Screen.cpp b/timbre/lib/Screen/Screen.cpp
+index 9a40e35..0ca5943 100644
+--- a/timbre/lib/Screen/Screen.cpp
++++ b/timbre/lib/Screen/Screen.cpp
+@@ -11,8 +11,25 @@ namespace
+   WiFiClient sseClient;
+   bool sseConnected = false;
+ 
+-  String lastText = "";
+-  String lastSev = "NORMAL";
++  // --- Estado de la pantalla (para re-enviarlo si la pagina se reconecta) ---
++  // status: linea efimera (progreso / eventos locales).
++  // card:   resultado FIJO. Solo lo reemplaza un resultado de severidad igual o
++  //         mayor (gana el peor del evento).
++  // hist:   ultimos HIST_MAX resultados (IA y locales), el mas nuevo al final.
++  struct Resultado
++  {
++    String text;
++    String sev;
++    String src;
++  };
++
++  constexpr int HIST_MAX = 5;
++
++  String lastStatus = "";
++  bool hayCard = false;
++  Resultado card;
++  Resultado hist[HIST_MAX];
++  int histCount = 0;
+ 
+   void (*hangupCb)() = nullptr;
+ 
+@@ -43,10 +60,22 @@ main{padding:16px 20px;display:flex;flex-direction:column;gap:16px;
+ .msg{padding:10px 14px;border-radius:8px;background:#171a21;
+  border-left:4px solid #3a3f4b;white-space:pre-wrap;}
+ .msg .t{font-size:12px;color:#8a90a0;margin-bottom:2px;}
+-.sev-HIGH{border-left-color:#e5484d;}
+-.sev-MEDIUM{border-left-color:#f5a623;}
+-.sev-LOW{border-left-color:#f2d600;}
++.sev-PELIGROSO{border-left-color:#e5484d;}
++.sev-SOSPECHOSO{border-left-color:#f5a623;}
++.sev-LLAMATIVO{border-left-color:#f2d600;}
+ .sev-NORMAL{border-left-color:#30a46c;}
++#statusline{font-size:14px;color:#a8aebd;padding:8px 12px;background:#171a21;
++ border-radius:8px;min-height:18px;}
++#statusline:before{content:'\25CF  ';color:#3e63dd;}
++#card{padding:14px 16px;border-radius:10px;background:#1b1f28;
++ border-left:6px solid #3a3f4b;font-size:17px;font-weight:600;white-space:pre-wrap;}
++#card .t{font-size:12px;color:#8a90a0;font-weight:400;margin-bottom:4px;}
++#card.sev-PELIGROSO{border-left-color:#e5484d;background:#3a1618;}
++#card.sev-SOSPECHOSO{border-left-color:#f5a623;}
++#card.sev-LLAMATIVO{border-left-color:#f2d600;}
++#card.sev-NORMAL{border-left-color:#30a46c;}
++h3{font-size:12px;color:#6a7080;margin:4px 0 0;font-weight:600;
++ text-transform:uppercase;letter-spacing:.5px;}
+ #empty{color:#6a7080;padding:20px;}
+ </style></head><body>
+ <header>
+@@ -57,7 +86,10 @@ main{padding:16px 20px;display:flex;flex-direction:column;gap:16px;
+   <img id='video' alt='stream'>
+   <div id='novideo'>Sin video (timbre en reposo)</div>
+   <canvas id='viz' height='48'></canvas>
+-  <div id='log'><div id='empty'>Esperando mensajes del gateway...</div></div>
++  <div id='statusline'>Timbre en reposo</div>
++  <div id='card'><div id='empty'>Sin analisis todavia</div></div>
++  <h3>Historial</h3>
++  <div id='log'></div>
+ </main>
+ <script>
+ var host = location.hostname;
+@@ -85,30 +117,45 @@ document.getElementById('hangup').onclick = function(){
+   }).catch(function(){});
+ };
+ 
+-// --- Mensajes del backend (SSE) ---
+-function add(sev,text){
++// --- Mensajes (SSE) ---
++// status: linea efimera. card: resultado fijo (lo decide el ESP32: gana el
++// de mayor severidad). hist: todos los resultados, el mas nuevo arriba.
++var HIST_MAX=5;
++function hora(){ return new Date().toLocaleTimeString(); }
++function head(o){
++  var h=document.createElement('div'); h.className='t';
++  h.textContent=hora()+' \u00b7 '+(o.src||'')+' \u00b7 '+(o.sev||'NORMAL');
++  return h;
++}
++function setCard(o){
++  var c=document.getElementById('card');
++  c.className='sev-'+(o.sev||'NORMAL'); c.innerHTML='';
++  var b=document.createElement('div'); b.textContent=o.text||'';
++  c.appendChild(head(o)); c.appendChild(b);
++}
++function addHist(o){
+   var log=document.getElementById('log');
+-  var t=new Date().toLocaleTimeString();
+-  log.innerHTML='';
+-  var d=document.createElement('div'); d.className='msg sev-'+sev;
+-  var head=document.createElement('div'); head.className='t';
+-  head.textContent=t+' \u00b7 '+sev;
+-  var body=document.createElement('div'); body.textContent=text;
+-  d.appendChild(head); d.appendChild(body);
+-  log.appendChild(d);
++  var d=document.createElement('div'); d.className='msg sev-'+(o.sev||'NORMAL');
++  var b=document.createElement('div'); b.textContent=o.text||'';
++  d.appendChild(head(o)); d.appendChild(b);
++  log.insertBefore(d, log.firstChild);
++  while(log.children.length>HIST_MAX) log.removeChild(log.lastChild);
++}
++function limpiar(){
++  document.getElementById('statusline').textContent='Timbre en reposo';
++  var c=document.getElementById('card'); c.className='';
++  c.innerHTML='<div id="empty">Sin analisis todavia</div>';
++  document.getElementById('log').innerHTML='';
+ }
+ var es=new EventSource('/events');
+ es.onmessage=function(e){
+   try{
+     var o=JSON.parse(e.data);
+-    if(o.clear){
+-      document.getElementById('log').innerHTML=
+-        '<div id="empty">Esperando mensajes del gateway...</div>';
+-      targetLevel=0;
+-      return;
+-    }
++    if(o.clear){ limpiar(); targetLevel=0; return; }
+     if(typeof o.level!=='undefined'){ targetLevel=o.level; return; }
+-    add(o.sev||'NORMAL', o.text||'');
++    if(o.kind==='status'){ document.getElementById('statusline').textContent=o.text||''; return; }
++    if(o.kind==='hist'){ addHist(o); return; }
++    if(o.kind==='card'){ setCard(o); return; }
+   }catch(err){}
+ };
+ 
+@@ -173,13 +220,34 @@ drawViz();
+     return o;
+   }
+ 
+-  void pushSse(const String &sev, const String &text)
++  void sseSend(const String &json)
+   {
+     if (sseConnected && sseClient.connected())
+-    {
+-      sseClient.print("data: {\"sev\":\"" + sev + "\",\"text\":\"" +
+-                      escapeJson(text) + "\"}\n\n");
+-    }
++      sseClient.print("data: " + json + "\n\n");
++  }
++
++  void pushStatus(const String &text)
++  {
++    sseSend("{\"kind\":\"status\",\"text\":\"" + escapeJson(text) + "\"}");
++  }
++
++  void pushResultado(const char *kind, const Resultado &r)
++  {
++    sseSend(String("{\"kind\":\"") + kind + "\",\"sev\":\"" + escapeJson(r.sev) +
++            "\",\"src\":\"" + escapeJson(r.src) + "\",\"text\":\"" +
++            escapeJson(r.text) + "\"}");
++  }
++
++  // NORMAL < LLAMATIVO < SOSPECHOSO < PELIGROSO (mismo orden que el backend).
++  int rango(const String &sev)
++  {
++    if (sev == "PELIGROSO")
++      return 3;
++    if (sev == "SOSPECHOSO")
++      return 2;
++    if (sev == "LLAMATIVO")
++      return 1;
++    return 0;
+   }
+ 
+   void handleRoot()
+@@ -198,8 +266,13 @@ drawViz();
+         "Connection: keep-alive\r\n"
+         "Access-Control-Allow-Origin: *\r\n"
+         "\r\n");
+-    if (lastText.length() > 0)
+-      pushSse(lastSev, lastText);
++    // La pagina pudo recargarse a mitad de evento: le re-mandamos todo.
++    for (int i = 0; i < histCount; i++)
++      pushResultado("hist", hist[i]);
++    if (hayCard)
++      pushResultado("card", card);
++    if (lastStatus.length() > 0)
++      pushStatus(lastStatus);
+   }
+ 
+   void handleHangup()
+@@ -239,22 +312,45 @@ namespace Screen
+     sseConnected = false;
+   }
+ 
+-  void showMessage(const String &text, const String &severity)
++  void showStatus(const String &text)
+   {
+-    lastText = text;
+-    lastSev = severity.length() ? severity : "NORMAL";
+-    Serial.printf("[SCREEN] %s | %s\n", lastSev.c_str(), text.c_str());
+-    pushSse(lastSev, text);
++    lastStatus = text;
++    Serial.printf("[SCREEN] estado | %s\n", text.c_str());
++    pushStatus(text);
+   }
+ 
+-  void clear()
++  void showResult(const String &text, const String &severity, const String &source)
+   {
+-    lastText = "";
+-    lastSev = "NORMAL";
+-    if (sseConnected && sseClient.connected())
++    Resultado r{text, severity.length() ? severity : String("NORMAL"), source};
++
++    // Historial: siempre.
++    if (histCount == HIST_MAX)
+     {
+-      sseClient.print("data: {\"clear\":true}\n\n");
++      for (int i = 1; i < HIST_MAX; i++)
++        hist[i - 1] = hist[i];
++      histCount--;
+     }
++    hist[histCount++] = r;
++    pushResultado("hist", r);
++
++    // Tarjeta fija: solo si es igual o peor que la actual.
++    bool fija = !hayCard || rango(r.sev) >= rango(card.sev);
++    if (fija)
++    {
++      card = r;
++      hayCard = true;
++      pushResultado("card", r);
++    }
++    Serial.printf("[SCREEN] resultado%s | %s | %s | %s\n", fija ? " (FIJO)" : "",
++                  r.sev.c_str(), r.src.c_str(), r.text.c_str());
++  }
++
++  void clear()
++  {
++    lastStatus = "";
++    hayCard = false;
++    histCount = 0;
++    sseSend("{\"clear\":true}");
+     Serial.println("[SCREEN] limpio mensajes");
+   }
+ 
+diff --git a/timbre/lib/Screen/Screen.h b/timbre/lib/Screen/Screen.h
+index 8daaa70..d3155bd 100644
+--- a/timbre/lib/Screen/Screen.h
++++ b/timbre/lib/Screen/Screen.h
+@@ -6,7 +6,18 @@ namespace Screen
+     void begin();
+     void handleClient();
+     void stop();
+-    void showMessage(const String &text, const String &severity = "NORMAL");
++    // Linea de ESTADO (efimera): progreso y eventos locales. Cada llamada
++    // reemplaza la anterior. No toca el resultado.
++    void showStatus(const String &text);
++
++    // RESULTADO de un analisis (IA del backend o tiny model / microfono local).
++    // Siempre entra al historial (ultimos 5). La tarjeta fija solo cambia si la
++    // severidad es igual o mayor a la que ya muestra: gana el peor del evento.
++    // Severidades: NORMAL < LLAMATIVO < SOSPECHOSO < PELIGROSO.
++    // source: de donde sale, p.ej. "IA - Imagen" o "Local - Camara".
++    void showResult(const String &text, const String &severity, const String &source);
++
++    // Limpia estado, tarjeta e historial (fin del evento).
+     void clear();
+ 
+     // Empuja el nivel de audio (0..32767) a la pagina para la animacion.

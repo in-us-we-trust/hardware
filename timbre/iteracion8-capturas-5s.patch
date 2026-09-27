@@ -1,0 +1,175 @@
+diff --git a/timbre/lib/BackendSession/BackendSession.cpp b/timbre/lib/BackendSession/BackendSession.cpp
+index 2dedd60..a7f66a1 100644
+--- a/timbre/lib/BackendSession/BackendSession.cpp
++++ b/timbre/lib/BackendSession/BackendSession.cpp
+@@ -114,6 +114,19 @@ namespace BackendSession
+         return true;
+     }
+ 
++    bool enviarCaptura(const String &id, const uint8_t *jpeg, size_t len)
++    {
++        if (!active || id != trackId)
++            return false;
++        String fotoB64 = toBase64(jpeg, len);
++        if (fotoB64.length() == 0)
++        {
++            Serial.println("[SESSION] no se pudo codificar la captura");
++            return false;
++        }
++        return MqttClient::publishCaptureImage(trackId, fotoB64);
++    }
++
+     bool iniciarMedia(const String &id)
+     {
+         // Path que el gateway reconstruye: {RTSP_BASE}/{deviceId}/doorbell/{trackId}.
+diff --git a/timbre/lib/BackendSession/BackendSession.h b/timbre/lib/BackendSession/BackendSession.h
+index 620c6cb..328fd8b 100644
+--- a/timbre/lib/BackendSession/BackendSession.h
++++ b/timbre/lib/BackendSession/BackendSession.h
+@@ -51,6 +51,11 @@ namespace BackendSession
+     // una constante hardcodeada de prueba, sin pasar por la fuente).
+     bool enviarFotoBase64(const String &trackId, const String &fotoBase64);
+ 
++    // Manda una foto ADICIONAL de la sesion (capture_image) con el JPEG en
++    // base64. Solo si hay sesion activa (press ya enviado) con ese trackId.
++    // Devuelve true si el publish salio.
++    bool enviarCaptura(const String &trackId, const uint8_t *jpeg, size_t len);
++
+     // Arranca el stream RTSPS hacia MediaMTX en {deviceId}/doorbell/{trackId}.
+     // Negocia todos los tracks con fuente, pero NO envia nada todavia.
+     // Se abre DESPUES del press, solo si hay persona o sonido; al quedar ready
+diff --git a/timbre/lib/Config/Config.h b/timbre/lib/Config/Config.h
+index 82a41c1..da689c5 100644
+--- a/timbre/lib/Config/Config.h
++++ b/timbre/lib/Config/Config.h
+@@ -155,6 +155,9 @@ namespace Config
+         // El ia_response de la IMAGE del press se espera SIEMPRE (sin timeout).
+         // Si el press no se pudo publicar, se reintenta cada PRESS_RETRY_MS.
+         constexpr uint32_t PRESS_RETRY_MS = 2000;
++        // Despues del press, cada cuanto se manda una foto nueva al backend
++        // (capture_image) mientras dure la llamada.
++        constexpr uint32_t CAPTURE_INTERVAL_MS = 5000;
+         // Mensajes de "progreso" en la Screen: solo salen si la pantalla estuvo
+         // quieta este tiempo (no pisan enseguida un resultado de la IA).
+         constexpr uint32_t PROGRESO_ESPERA_MS = 2500; // esperando la respuesta del press
+diff --git a/timbre/lib/EventFlow/EventFlow.cpp b/timbre/lib/EventFlow/EventFlow.cpp
+index a7c9f9b..fd73ac1 100644
+--- a/timbre/lib/EventFlow/EventFlow.cpp
++++ b/timbre/lib/EventFlow/EventFlow.cpp
+@@ -64,6 +64,8 @@ namespace
+     // Llego el ia_response de la IMAGE del press (lo marca onRespuesta).
+     bool respuestaImagen = false;
+     bool reintentandoPress = false;
++    // Ultima foto mandada al backend (press o capture_image).
++    unsigned long ultimaCapturaMs = 0;
+ 
+     // Pico del nivel de microfono desde la ultima vez que se evaluo. level() es
+     // solo el RMS del ultimo chunk (20ms): si se lee cada 1s, un sonido corto
+@@ -379,9 +381,36 @@ namespace
+         return true;
+     }
+ 
++    // Despues del press y mientras dure la llamada, cada CAPTURE_INTERVAL_MS se
++    // manda una foto nueva al backend (capture_image). El gateway la analiza
++    // como IMAGE y responde por ia_response.
++    void enviarCapturaPeriodica()
++    {
++        switch (backend)
++        {
++        case Backend::ESPERANDO_IA:
++        case Backend::SIN_MEDIA:
++        case Backend::ABRIENDO_MEDIA:
++        case Backend::EN_SESION:
++            break;
++        default:
++            return; // sin press todavia, o backend cerrado (STOP_DANGER)
++        }
++        if (millis() - ultimaCapturaMs < Config::Event::CAPTURE_INTERVAL_MS)
++            return;
++        ultimaCapturaMs = millis();
++
++        if (!capturarFoto())
++            return;
++        if (BackendSession::enviarCaptura(trackId, foto, fotoLen))
++            Serial.printf("[FLOW] capture_image enviada (%u bytes)\n", (unsigned)fotoLen);
++        else
++            Serial.println("[FLOW] no se pudo enviar la capture_image");
++    }
++
+     // ESPERANDO_IA: foto nueva + tiny model y chequeo de sonido. Se saca foto
+-    // SIEMPRE (aunque ya se haya visto a alguien).
+-    // TODO: en el futuro estas fotos tambien se mandan al backend.
++    // SIEMPRE (aunque ya se haya visto a alguien). Las que van al backend las
++    // manda enviarCapturaPeriodica() cada CAPTURE_INTERVAL_MS.
+     void analizarMientrasEspera()
+     {
+         bool persona = hayPersonaEnFrame(); // captura un frame nuevo
+@@ -541,6 +570,7 @@ namespace EventFlow
+                     reintentandoPress = false;
+                     cambiarEstado(Backend::ESPERANDO_IA);
+                     ultimaEvaluacionMs = millis();
++                    ultimaCapturaMs = millis();
+                 }
+                 else
+                 {
+@@ -677,6 +707,8 @@ namespace EventFlow
+         }
+         }
+ 
++        enviarCapturaPeriodica();
++
+         if (hangupPedido)
+         {
+             hangupPedido = false;
+diff --git a/timbre/lib/MqttClient/MqttClient.cpp b/timbre/lib/MqttClient/MqttClient.cpp
+index 1965246..1cf39a3 100644
+--- a/timbre/lib/MqttClient/MqttClient.cpp
++++ b/timbre/lib/MqttClient/MqttClient.cpp
+@@ -370,11 +370,16 @@ namespace MqttClient
+         return publishJson(topic, doc);
+     }
+ 
+-    bool publishCaptureImage(const String &trackId)
++    bool publishCaptureImage(const String &trackId, const String &imageBase64)
+     {
+         JsonDocument doc;
+         addTimestamp(doc);
+-        return publishJson(topicFor(trackId, ACTION_CAPTURE_IMAGE), doc);
++        if (imageBase64.length() > 0)
++            doc["image"] = imageBase64;
++        String topic = topicFor(trackId, ACTION_CAPTURE_IMAGE);
++        Serial.printf("[MQTT] -> %s (imagen %u chars)\n",
++                      topic.c_str(), (unsigned)imageBase64.length());
++        return publishJson(topic, doc);
+     }
+ 
+     bool publishCaptureAudio(const String &trackId)
+diff --git a/timbre/lib/MqttClient/MqttClient.h b/timbre/lib/MqttClient/MqttClient.h
+index a2c0633..c707581 100644
+--- a/timbre/lib/MqttClient/MqttClient.h
++++ b/timbre/lib/MqttClient/MqttClient.h
+@@ -30,7 +30,8 @@
+ //   stream_start:{"timestamp":<ms>}  el RTSP de este trackId ya esta publicando.
+ //                (El press ya NO implica RTSP: se abre solo si hay persona/sonido.)
+ //   stream_end:  {"timestamp":<ms>}
+-//   capture_*:   {"timestamp":<ms>}
++//   capture_image: {"timestamp":<ms>,"image":"<base64 JPEG>"}
++//   capture_audio: {"timestamp":<ms>}
+ //   ia_response (entrada):
+ //                {"messageId":"<uuid>","chunkType":"IMAGE|VIDEO|AUDIO",
+ //                 "action":"CONTINUE|STOP_DANGER","severity":"...","message":"..."}
+@@ -105,7 +106,12 @@ namespace MqttClient
+     // stream_end: cierre de la llamada trackId.
+     bool publishStreamEnd(const String &trackId);
+ 
+-    // Captura on-demand (opcional, no es el flujo de timbre).
+-    bool publishCaptureImage(const String &trackId);
++    // capture_image: foto adicional de la llamada trackId (despues del press).
++    //   imageBase64: JPEG en Base64, igual que en el press. El gateway la manda
++    //                al detective-manager como IMAGE y responde por ia_response.
++    //                Requiere la sesion abierta por el press.
++    bool publishCaptureImage(const String &trackId, const String &imageBase64 = "");
++
++    // capture_audio: on-demand (opcional, el gateway lo saca del RTSP).
+     bool publishCaptureAudio(const String &trackId);
+ }

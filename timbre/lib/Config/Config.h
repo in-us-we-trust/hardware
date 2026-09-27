@@ -149,24 +149,38 @@ namespace Config
     namespace Event
     {
         constexpr uint32_t BACKEND_CONNECT_TIMEOUT_MS = 10000;
+        // Espera tras prender la camara antes de sacar la foto del press (los
+        // primeros frames salen oscuros).
+        constexpr uint32_t FOTO_WARMUP_MS = 1000;
+        // El ia_response de la IMAGE del press se espera SIEMPRE (sin timeout).
+        // Si el press no se pudo publicar, se reintenta cada PRESS_RETRY_MS.
+        constexpr uint32_t PRESS_RETRY_MS = 2000;
+        // Despues del press, cada cuanto se saca una foto, se pasa por el tiny
+        // model y, SOLO si hay persona, se manda al backend (capture_image).
+        constexpr uint32_t CAPTURE_INTERVAL_MS = 5000;
+        // Solo una foto en analisis a la vez: la proxima captura espera el
+        // ia_response IMAGE de la anterior (press o captura). Si no llega en
+        // este tiempo, se sigue igual para no cortar las capturas.
+        constexpr uint32_t CAPTURE_RESPONSE_TIMEOUT_MS = 30000;
+        // Mensajes de "progreso" en la Screen: solo salen si la pantalla estuvo
+        // quieta este tiempo (no pisan enseguida un resultado de la IA).
+        constexpr uint32_t PROGRESO_ESPERA_MS = 2500; // esperando la respuesta del press
+        constexpr uint32_t PROGRESO_SESION_MS = 6000; // monitoreo / sesion en vivo
         // Cuanto esperar a que el RTSPS quede ready (TLS + ANNOUNCE/SETUP/RECORD)
-        // antes de mandar el press igual (solo IMAGE).
+        // antes de desistir; se reintenta tras MEDIA_RETRY_MS.
         constexpr uint32_t RTSP_READY_TIMEOUT_MS = 8000;
+        constexpr uint32_t MEDIA_RETRY_MS = 5000;
         constexpr uint32_t AUDIO_LEVEL_THROTTLE_MS = 120; // push nivel a Screen
 
-        // Con el stream local ya corriendo, cada cuanto se re-evalua si hay
-        // motivo (sonido o persona) para CONECTAR al backend. El primer chequeo
-        // cae un intervalo despues del timbre, lo que da warm-up a camara/mic.
-        constexpr uint32_t EVAL_INTERVAL_MS = 1000;
-
-        // Cada cuanto EventFlow re-evalua que mandar por RTSP. Audio y video
-        // van a distinta frecuencia a proposito:
+        // Deteccion local durante la llamada. Audio y video van a distinta
+        // frecuencia a proposito:
         //  - Audio: leer el nivel del mic es baratisimo y un sonido corto no
         //    debe pasar entre chequeos, asi que se evalua seguido.
-        //  - Video: el tiny model es caro y comparte la camara con MJPEG/RTSP,
-        //    asi que se evalua espaciado.
+        //  - Persona: el tiny model es caro (~0.4 s) y comparte la camara con
+        //    MJPEG/RTSP; corre cada EVAL_INTERVAL_MS solo hasta ver a alguien
+        //    (despues lo sigue corriendo la captura cada CAPTURE_INTERVAL_MS).
         constexpr uint32_t AUDIO_DETECT_INTERVAL_MS = 50;
-        constexpr uint32_t VIDEO_DETECT_INTERVAL_MS = 500;
+        constexpr uint32_t EVAL_INTERVAL_MS = 1000;
         // Umbral de nivel de microfono (0..32767) para considerar que "hay
         // sonido" y empezar a mandar audio. TODO: ajustar en campo (el gate de
         // ruido base de la pantalla ronda 800).

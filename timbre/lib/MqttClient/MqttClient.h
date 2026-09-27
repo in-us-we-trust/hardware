@@ -15,6 +15,7 @@
 // Topicos (la identidad va SOLO en el topico, nunca en el JSON):
 //   Publica (QoS 1, sin retain):
 //     home/{deviceId}/events/{trackId}/press
+//     home/{deviceId}/events/{trackId}/stream_start  (RTSP publicando; ver abajo)
 //     home/{deviceId}/events/{trackId}/stream_end
 //     home/{deviceId}/events/{trackId}/capture_image   (opcional)
 //     home/{deviceId}/events/{trackId}/capture_audio   (opcional)
@@ -26,8 +27,11 @@
 // Payloads (JSON compacto UTF-8):
 //   press:       {"event":"press","timestamp":<ms>,"image":"<b64>","batteryPercentage":<f>}
 //                timestamp/image/batteryPercentage son opcionales.
+//   stream_start:{"timestamp":<ms>}  el RTSP de este trackId ya esta publicando.
+//                (El press ya NO implica RTSP: se abre solo si hay persona/sonido.)
 //   stream_end:  {"timestamp":<ms>}
-//   capture_*:   {"timestamp":<ms>}
+//   capture_image: {"timestamp":<ms>,"image":"<base64 JPEG>"}
+//   capture_audio: {"timestamp":<ms>}
 //   ia_response (entrada):
 //                {"messageId":"<uuid>","chunkType":"IMAGE|VIDEO|AUDIO",
 //                 "action":"CONTINUE|STOP_DANGER","severity":"...","message":"..."}
@@ -96,10 +100,18 @@ namespace MqttClient
                       const String &imageBase64 = "",
                       float batteryPercentage = NAN);
 
+    // stream_start: el RTSP de trackId esta publicando (el gateway puede PLAY).
+    bool publishStreamStart(const String &trackId);
+
     // stream_end: cierre de la llamada trackId.
     bool publishStreamEnd(const String &trackId);
 
-    // Captura on-demand (opcional, no es el flujo de timbre).
-    bool publishCaptureImage(const String &trackId);
+    // capture_image: foto adicional de la llamada trackId (despues del press).
+    //   imageBase64: JPEG en Base64, igual que en el press. El gateway la manda
+    //                al detective-manager como IMAGE y responde por ia_response.
+    //                Requiere la sesion abierta por el press.
+    bool publishCaptureImage(const String &trackId, const String &imageBase64 = "");
+
+    // capture_audio: on-demand (opcional, el gateway lo saca del RTSP).
     bool publishCaptureAudio(const String &trackId);
 }

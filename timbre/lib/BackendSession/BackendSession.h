@@ -51,12 +51,17 @@ namespace BackendSession
     // una constante hardcodeada de prueba, sin pasar por la fuente).
     bool enviarFotoBase64(const String &trackId, const String &fotoBase64);
 
+    // Manda una foto ADICIONAL de la sesion (capture_image) con el JPEG en
+    // base64. Solo si hay sesion activa (press ya enviado) con ese trackId.
+    // Devuelve true si el publish salio.
+    bool enviarCaptura(const String &trackId, const uint8_t *jpeg, size_t len);
+
     // Arranca el stream RTSPS hacia MediaMTX en {deviceId}/doorbell/{trackId}.
     // Negocia todos los tracks con fuente, pero NO envia nada todavia.
-    // Contrato: el path tiene que estar READY ANTES del press (si no, el PLAY
-    // del gateway da 404). Por eso EventFlow lo llama antes de enviarFoto y
-    // espera mediaLista(). El audio y el video van por RTSP y el gateway los
-    // extrae en chunks. Devuelve true si arranco la negociacion (TLS OK).
+    // Se abre DESPUES del press, solo si hay persona o sonido; al quedar ready
+    // se avisa con avisarInicioMedia() (stream_start). El audio y el video van
+    // por RTSP y el gateway los extrae en chunks. Devuelve true si arranco la
+    // negociacion (TLS OK).
     bool iniciarMedia(const String &trackId);
 
     // true cuando MediaMTX acepto el RECORD (path ready para el PLAY del gateway).
@@ -64,6 +69,14 @@ namespace BackendSession
 
     // true si la negociacion RTSP fallo (TLS, 401, SETUP...).
     bool mediaFallo();
+
+    // Publica stream_start: el RTSP de trackId ya esta publicando y el gateway
+    // puede hacer PLAY. Se llama cuando mediaLista() da true.
+    void avisarInicioMedia(const String &trackId);
+
+    // Frena el RTSP sin cerrar la sesion MQTT (no publica stream_end). Para
+    // cuando la negociacion falla y se vuelve al analisis local.
+    void detenerMedia();
 
     // Prende/apaga el envio de cada track EN VIVO (sin reconectar). Lo llama
     // EventFlow segun su deteccion: audio cuando hay sonido, video cuando el

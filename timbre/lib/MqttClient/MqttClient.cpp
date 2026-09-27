@@ -46,6 +46,7 @@ namespace
 {
     const char *ACTION_PRESS = "press";
     const char *ACTION_STREAM_END = "stream_end";
+    const char *ACTION_STREAM_START = "stream_start";
     const char *ACTION_CAPTURE_IMAGE = "capture_image";
     const char *ACTION_CAPTURE_AUDIO = "capture_audio";
     const char *ACTION_IA_RESPONSE = "ia_response";
@@ -360,11 +361,25 @@ namespace MqttClient
         return publishJson(topic, doc);
     }
 
-    bool publishCaptureImage(const String &trackId)
+    bool publishStreamStart(const String &trackId)
     {
         JsonDocument doc;
         addTimestamp(doc);
-        return publishJson(topicFor(trackId, ACTION_CAPTURE_IMAGE), doc);
+        String topic = topicFor(trackId, ACTION_STREAM_START);
+        Serial.printf("[MQTT] -> %s\n", topic.c_str());
+        return publishJson(topic, doc);
+    }
+
+    bool publishCaptureImage(const String &trackId, const String &imageBase64)
+    {
+        JsonDocument doc;
+        addTimestamp(doc);
+        if (imageBase64.length() > 0)
+            doc["image"] = imageBase64;
+        String topic = topicFor(trackId, ACTION_CAPTURE_IMAGE);
+        Serial.printf("[MQTT] -> %s (imagen %u chars)\n",
+                      topic.c_str(), (unsigned)imageBase64.length());
+        return publishJson(topic, doc);
     }
 
     bool publishCaptureAudio(const String &trackId)
