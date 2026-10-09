@@ -21,20 +21,20 @@
 //
 // Flujo del BACKEND:
 //   1. ANALIZANDO_FOTO  foto del timbre -> tiny model (persona si/no).
-//   2. CONECTANDO       MQTT (mTLS) y press con esa foto, SIEMPRE (haya o no
-//                       persona). Si el publish falla, se reintenta.
+//   2. CONECTANDO       MQTT (mTLS) y press, SIEMPRE (haya o no persona). La
+//                       foto va en el press solo si el tiny model vio una
+//                       persona. Si el publish falla, se reintenta.
 //   3. ACTIVO           llamada en curso. En paralelo:
 //        - Deteccion local: sonido (mic) seguido; persona (tiny model) cada
 //          EVAL_INTERVAL_MS mientras no se haya visto a nadie.
 //        - Fotos al backend: cada CAPTURE_INTERVAL_MS se saca una foto, pasa
 //          por el tiny model y SOLO si hay persona se manda (capture_image).
-//        - Media (RTSP):
-//            AUDIO: se manda apenas se detecta sonido, haya llegado o no el
-//                   ia_response del press.
-//            VIDEO: se manda si hay persona Y ya llego el ia_response de la
-//                   IMAGE (se espera siempre, sin timeout).
+//        - Media (RTSP): no espera el ia_response de la IMAGE.
+//            AUDIO: se manda apenas hay sonido.
+//            VIDEO: se manda apenas hay persona.
 //          El RTSP se abre con lo primero que haga falta y el otro track se
-//          prende en vivo despues.
+//          prende en vivo despues. Si la IMAGE vuelve STOP_DANGER, onRespuesta
+//          corta el RTSP (y el gateway tambien corta su sesion).
 //   FINALIZADO          STOP_DANGER: backend cerrado para este evento.
 //
 // Screen: linea de ESTADO (cada paso + mensajes "de progreso" rotativos para
@@ -100,9 +100,12 @@ namespace
     // lo consume.
     uint16_t picoAudio = 0;
 
-    // Que ya se detecto en este evento. Una vez en true, queda.
+    // Que ya se detecto en este evento. videoDetectado, una vez en true, queda.
+    // audioDetectado se reevalua: se apaga tras AUDIO_SILENCE_TIMEOUT_MS sin
+    // sonido (ultimoAudioDetectadoMs) y se vuelve a prender si hay sonido.
     bool audioDetectado = false;
     bool videoDetectado = false;
+    unsigned long ultimoAudioDetectadoMs = 0;
 
     // Foto del evento (JPEG, PSRAM). onTimbre la saca apenas se toca el timbre;
     // hayPersonaEnFrame() analiza esa primero y despues va capturando frames
@@ -297,6 +300,7 @@ namespace
     {
         audioDetectado = false;
         videoDetectado = false;
+        ultimoAudioDetectadoMs = 0;
         fotoSinAnalizar = false;
         fotoLen = 0;
         personaEnFoto = false;
@@ -406,22 +410,22 @@ namespace
 
 namespace
 {
-    // Publica el press con la foto analizada. Mensaje en pantalla segun lo que
-    // dijo el tiny model, para que el usuario sepa que se esta analizando.
+    // Publica el press. La foto va SOLO si el tiny model vio una persona en
+    // ella; si no, el press sale sin imagen (es opcional). Mensaje en pantalla
+    // segun el caso, para que el usuario sepa que se esta haciendo.
     bool enviarPress()
     {
-        // Si todavia no hay foto (fallo la del timbre), sacamos una ahora.
-        if (fotoLen == 0)
-            capturarFoto();
-        if (!BackendSession::enviarFotoBase64(trackId, CameraSource::toBase64(foto, fotoLen)))
+        String fotoB64 = personaEnFoto ? CameraSource::toBase64(foto, fotoLen) : String("");
+        if (!BackendSession::enviarFotoBase64(trackId, fotoB64))
         {
             Serial.println("[FLOW] fallo el press");
             return false;
         }
-        Serial.printf("[FLOW] press enviado trackId=%s (persona local=%s)\n",
-                      trackId.c_str(), personaEnFoto ? "si" : "no");
+        Serial.printf("[FLOW] press enviado trackId=%s (persona local=%s, %s)\n",
+                      trackId.c_str(), personaEnFoto ? "si" : "no",
+                      personaEnFoto ? "con foto" : "sin foto");
         estado(personaEnFoto ? "Reconociendo a la persona en la imagen..."
-                             : "Buscando objetos peligrosos en la imagen...");
+                             : "Sin personas a la vista. Sigo monitoreando la entrada...");
         return true;
     }
 
@@ -432,24 +436,33 @@ namespace
             return;
         videoDetectado = true;
         resultado("Persona detectada en la puerta", "NORMAL", ORIGEN_CAMARA);
-        if (!respuestaImagen)
-            estado("Persona detectada. Esperando el analisis de la IA...");
     }
 
     // --- Deteccion local -------------------------------------------------------
-    // Sonido: chequeo barato y seguido (AUDIO_DETECT_INTERVAL_MS).
+    // Sonido: chequeo barato y seguido (AUDIO_DETECT_INTERVAL_MS), siempre: si
+    // no hay sonido durante AUDIO_SILENCE_TIMEOUT_MS se apaga el audio.
     // Persona: tiny model cada EVAL_INTERVAL_MS, solo mientras no se vio a nadie
     // (despues lo sigue corriendo la captura cada 5 s).
     void detectarLocal()
     {
-        if (!audioDetectado &&
-            millis() - ultimoSonidoMs >= Config::Event::AUDIO_DETECT_INTERVAL_MS)
+        if (millis() - ultimoSonidoMs >= Config::Event::AUDIO_DETECT_INTERVAL_MS)
         {
             ultimoSonidoMs = millis();
             if (haySonido())
             {
-                audioDetectado = true;
-                resultado("Se escucha a alguien en la puerta", "NORMAL", ORIGEN_MICROFONO);
+                ultimoAudioDetectadoMs = millis();
+                if (!audioDetectado)
+                {
+                    audioDetectado = true;
+                    resultado("Se escucha a alguien en la puerta", "NORMAL", ORIGEN_MICROFONO);
+                }
+            }
+            else if (audioDetectado &&
+                     millis() - ultimoAudioDetectadoMs >= Config::Event::AUDIO_SILENCE_TIMEOUT_MS)
+            {
+                audioDetectado = false;
+                Serial.printf("[FLOW] %lu ms sin sonido -> audio OFF\n",
+                              (unsigned long)Config::Event::AUDIO_SILENCE_TIMEOUT_MS);
             }
         }
 
@@ -499,10 +512,11 @@ namespace
     }
 
     // --- Media (RTSP) ----------------------------------------------------------
-    // AUDIO: apenas hay sonido (no espera la IA).
-    // VIDEO: hay persona Y ya llego el ia_response de la IMAGE.
-    bool quiereAudio() { return audioDetectado && respuestaImagen; }
-    bool quiereVideo() { return videoDetectado && respuestaImagen; }
+    // No se espera el ia_response de la IMAGE (el analisis puede tardar ~1 min):
+    // AUDIO apenas hay sonido, VIDEO apenas hay persona. Un STOP_DANGER de la
+    // IMAGE corta el RTSP en onRespuesta.
+    bool quiereAudio() { return audioDetectado; }
+    bool quiereVideo() { return videoDetectado; }
 
     const char *textoTransmitiendo(bool video, bool audio)
     {
@@ -568,12 +582,20 @@ namespace
             return;
 
         case Media::PUBLICANDO:
-            // Prende en vivo el track que falte (sin reconectar).
+            // Prende en vivo el track que falte (sin reconectar). El audio
+            // tambien se apaga si quedo en silencio.
             if (audio && !audioEnviando)
             {
                 BackendSession::activarAudio(true);
                 audioEnviando = true;
                 estado(textoTransmitiendo(videoEnviando, true));
+            }
+            else if (!audio && audioEnviando)
+            {
+                BackendSession::activarAudio(false);
+                audioEnviando = false;
+                if (videoEnviando)
+                    estado(textoTransmitiendo(true, false));
             }
             if (video && !videoEnviando)
             {
@@ -600,7 +622,9 @@ namespace
         }
         if (media == Media::ABRIENDO)
             return;
-        if (!respuestaImagen)
+        // Solo se "espera a la IA" si hay una imagen mandada o por mandar: la
+        // del press (personaEnFoto) o una captura con persona (videoDetectado).
+        if (!respuestaImagen && (personaEnFoto || videoDetectado))
         {
             if (videoDetectado)
                 progreso(PROGRESO_CON_PERSONA, Config::Event::PROGRESO_ESPERA_MS);
@@ -718,6 +742,8 @@ namespace EventFlow
                 personaEnFoto = hayPersonaEnFrame();
                 videoDetectado = personaEnFoto;
                 audioDetectado = haySonido();
+                if (audioDetectado)
+                    ultimoAudioDetectadoMs = millis();
                 // Resultado LOCAL (tiny model / microfono): va a la tarjeta
                 // hasta que llegue algo de la IA.
                 resultado(personaEnFoto ? "Persona detectada en la puerta"
@@ -725,7 +751,8 @@ namespace EventFlow
                           "NORMAL", ORIGEN_CAMARA);
                 if (audioDetectado)
                     resultado("Se escucha a alguien en la puerta", "NORMAL", ORIGEN_MICROFONO);
-                estado("Enviando la imagen para analizarla...");
+                estado(personaEnFoto ? "Enviando la imagen para analizarla..."
+                                     : "Avisando al servicio de analisis...");
                 // 2) conectar para mandar el press (siempre, haya o no persona)
                 BackendSession::conectar();
                 cambiarEstado(Backend::CONECTANDO);
@@ -746,14 +773,16 @@ namespace EventFlow
                     ultimoSonidoMs = millis();
                     ultimaCapturaMs = millis();
                     // La foto del press tambien cuenta: la primera captura
-                    // espera su respuesta.
-                    fotoEnAnalisis = true;
+                    // espera su respuesta. Si el press salio sin foto no
+                    // hay nada que esperar.
+                    fotoEnAnalisis = personaEnFoto;
                     fotoEnviadaMs = millis();
                 }
                 else
                 {
                     // Sin press no hay sesion: se reintenta.
-                    estado("No se pudo enviar la imagen. Reintentando...");
+                    estado(personaEnFoto ? "No se pudo enviar la imagen. Reintentando..."
+                                         : "No se pudo avisar al servicio de analisis. Reintentando...");
                     reintentandoPress = true;
                     BackendSession::conectar();
                     cambiarEstado(Backend::CONECTANDO);

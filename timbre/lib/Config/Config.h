@@ -168,7 +168,7 @@ namespace Config
         // Espera tras prender la camara antes de sacar la foto del press (los
         // primeros frames salen oscuros).
         constexpr uint32_t FOTO_WARMUP_MS = 1000;
-        // El ia_response de la IMAGE del press se espera SIEMPRE (sin timeout).
+        // El audio y el video NO esperan el ia_response de la IMAGE del press.
         // Si el press no se pudo publicar, se reintenta cada PRESS_RETRY_MS.
         constexpr uint32_t PRESS_RETRY_MS = 2000;
         // Despues del press, cada cuanto se saca una foto, se pasa por el tiny
@@ -197,6 +197,9 @@ namespace Config
         //    (despues lo sigue corriendo la captura cada CAPTURE_INTERVAL_MS).
         constexpr uint32_t AUDIO_DETECT_INTERVAL_MS = 50;
         constexpr uint32_t EVAL_INTERVAL_MS = 1000;
+        // Si no hay sonido durante esta ventana, se apaga la pista de audio
+        // RTSP (el video sigue). Vuelve a prenderse apenas haya sonido.
+        constexpr uint32_t AUDIO_SILENCE_TIMEOUT_MS = 5000;
         // Umbral de nivel de microfono (0..32767) para considerar que "hay
         // sonido" y empezar a mandar audio. TODO: ajustar en campo (el gate de
         // ruido base de la pantalla ronda 800).
