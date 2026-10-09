@@ -46,4 +46,11 @@ namespace Storage
         prefs.end();
         return password;
     }
+
+    void clearWifiCredentials()
+    {
+        prefs.begin("wifi", false);
+        prefs.clear();
+        prefs.end();
+    }
 }

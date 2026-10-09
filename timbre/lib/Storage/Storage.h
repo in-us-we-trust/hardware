@@ -15,4 +15,5 @@ namespace Storage
     void saveWifiCredentials(const String &ssid, const String &password);
     String loadWifiSSID();
     String loadWifiPassword();
+    void clearWifiCredentials();
 }

@@ -2,9 +2,10 @@
 #include <Arduino.h>
 
 // ---------------------------------------------------------------------------
-// ApiClient: habla HTTPS con mTLS contra el gateway (backend Go en
-// 34.120.207.250). Usa los certificados definidos en Certs.h/.cpp para
-// el handshake mutuo (equivalente al --cert/--key que le pasan a Postman).
+// ApiClient: habla con el gateway (backend Go) en Config::Api::URL
+// (-DGATEWAY_URL). Con https:// usa mTLS con los certificados de Certs.h/.cpp
+// (equivalente al --cert/--key que le pasan a Postman); con http:// va plano
+// y manda el device id en X-Device-ID.
 // ---------------------------------------------------------------------------
 namespace ApiClient
 {

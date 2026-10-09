@@ -59,6 +59,22 @@
 #ifndef MEDIAMTX_PATH
 #define MEDIAMTX_PATH "doorbell"
 #endif
+// URL base del gateway (registro / events). http:// = sin TLS (manda el id en
+// X-Device-ID); https:// = mTLS con los certs del device. El host se resuelve
+// por DNS. Ojo: "localhost" en el ESP32 es el propio ESP32; para un gateway
+// local usar la IP de la PC en la LAN.
+// GATEWAY_TLS_HOSTNAME: nombre para SNI/validacion del cert y header Host
+// (solo https). Vacio = el host de GATEWAY_URL. Hace falta cuando la URL es
+// una IP (mismo tema de SANs IP que MQTT_TLS_HOSTNAME).
+#ifndef GATEWAY_URL
+#define GATEWAY_URL "https://34.120.207.250"
+#ifndef GATEWAY_TLS_HOSTNAME
+#define GATEWAY_TLS_HOSTNAME "api.hogarseguro.local"
+#endif
+#endif
+#ifndef GATEWAY_TLS_HOSTNAME
+#define GATEWAY_TLS_HOSTNAME ""
+#endif
 
 // --- Identidad del dispositivo ----------------------------------------------
 // Sin default a proposito: tiene que coincidir con el CN del certificado del
@@ -233,14 +249,16 @@ namespace Config
         constexpr const char *PASS = MEDIAMTX_PASS;
     }
 
-    // --- Gateway HTTP mTLS (ApiClient) --------------------------------------
+    // --- Gateway HTTP/HTTPS (ApiClient) -------------------------------------
     namespace Api
     {
-        constexpr const char *GATEWAY_HOST = "api.hogarseguro.local"; // SNI/TLS
-        // IP publica del gateway (el host .local no resuelve por DNS).
-        constexpr uint8_t GATEWAY_IP[4] = {34, 120, 207, 250};
-        constexpr uint16_t GATEWAY_PORT = 443;
+        constexpr const char *URL = GATEWAY_URL;
+        constexpr const char *TLS_HOSTNAME = GATEWAY_TLS_HOSTNAME;
         constexpr uint32_t TLS_TIMEOUT_MS = 15000;
+        // Registro del dispositivo durante la vinculacion: si fallan todos los
+        // intentos, se descarta el WiFi recibido (no queda a medio vincular).
+        constexpr int REGISTER_ATTEMPTS = 3;
+        constexpr uint32_t REGISTER_RETRY_MS = 2000;
         constexpr const char *PATH_DEVICES = "/api/v1/devices";
         constexpr const char *PATH_EVENTS = "/api/v1/events";
     }
