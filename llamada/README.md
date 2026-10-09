@@ -1,3 +1,13 @@
+# Qué hace?
+Dos flujos en paralelo que simulan una llamada:  
+ESP32 micrófono ─────► PC parlantes  
+ESP32 parlante   ◄────   PC microfono
+
+# Cómo ejecutar:
+1. Primero subir y correr el archivo llamada.ino al esp32.
+2. Segundo ejeuctar archivo de la pc.
+3. Ya se puede hablar por el micrófono de alguno y escuchar en los parantes del otro. Mantener pc y timbre alejados porque generaría un eco y ruido molesto. 
+
 # Cambios en el código antes de ejecutar:
 ## En archivo del esp32:
 Hay que cambiar estos 3 datos:
