@@ -3,7 +3,6 @@
 #include "Config.h"
 #include "WebPortal.h"
 #include "BleManager.h"
-#include "CameraSource.h"
 
 #include <Arduino.h>
 
@@ -11,12 +10,8 @@ namespace ModoVinculacion
 {
     void begin(const String &bleName)
     {
-        // Wokwi no simula camara ni BLE; en hardware real, si.
-        if (!Config::Env::IS_WOKWI_SIM)
-        {
-            Camera.begin();
-        }
         WebPortal::begin(bleName);
+        // Wokwi no simula BLE; en hardware real, si.
         if (!Config::Env::IS_WOKWI_SIM)
         {
             BleManager::begin(bleName);

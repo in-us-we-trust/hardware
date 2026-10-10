@@ -5,7 +5,6 @@
 #include "Storage.h"
 #include "ApiClient.h"
 #include "Config.h"
-#include "CameraSource.h"
 
 #include <BLEDevice.h>
 #include <BLEServer.h>
@@ -30,9 +29,16 @@ namespace
     String pendingSsid;
     String pendingPassword;
     String bootTimestamp;
-    bool gatewayReady = false;
     bool awaitingRegistrationConfirmation = false;
-    unsigned long lastEventSentAt = 0;
+
+    // Vinculacion terminada: reinicia y main.cpp arranca en Modo::Operacion
+    // (hay WiFi guardado). Asi se libera BLE/AP/portal sin desarmarlos a mano.
+    void restartIntoOperacion()
+    {
+        WebPortal::sendSSE("Reiniciando en modo operacion...");
+        delay(1000); // deja salir el SSE / notify BLE
+        ESP.restart();
+    }
 
     // -----------------------------------------------------------------------
     // Callback: maneja conexion/desconexion BLE
@@ -83,10 +89,7 @@ namespace
                 WebPortal::sendSSE("✅ Dispositivo vinculado!");
                 Storage::saveDeviceRegistered(true);
                 awaitingRegistrationConfirmation = false;
-                gatewayReady = true;
-                delay(500);
-                BleManager::stop();
-                WebPortal::stop();
+                restartIntoOperacion();
             }
             else
             {
@@ -177,38 +180,7 @@ namespace BleManager
     void loop()
     {
         if (!pendingWifiConnect)
-        {
-            if (!gatewayReady)
-            {
-                return;
-            }
-
-            if (millis() - lastEventSentAt < 30000)
-            {
-                return;
-            }
-
-            lastEventSentAt = millis();
-            String imageBase64 = Camera.captureBase64();
-            if (imageBase64.isEmpty())
-            {
-                WebPortal::sendSSE(" No se pudo capturar imagen para events");
-                return;
-            }
-
-            String apiResponse;
-            bool sent = ApiClient::sendEvent("motion", imageBase64, &apiResponse);
-            if (sent)
-            {
-                WebPortal::sendSSE("Event enviado al gateway");
-            }
-            else
-            {
-                WebPortal::sendSSE("Fallo el envio del event");
-            }
-
             return;
-        }
 
         // Consumimos el pedido primero para no reprocesarlo si algo tarda.
         pendingWifiConnect = false;
@@ -265,9 +237,8 @@ namespace BleManager
 
                 if (deviceAlreadyRegistered)
                 {
-                    gatewayReady = true;
-                    lastEventSentAt = millis() - 30000;
-                    WebPortal::sendSSE("✅ Dispositivo ya registrado. Enviando events...");
+                    WebPortal::sendSSE("✅ Dispositivo ya registrado.");
+                    restartIntoOperacion();
                 }
                 else
                 {
