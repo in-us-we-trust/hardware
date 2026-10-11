@@ -1,0 +1,625 @@
+diff --git a/timbre/lib/BackendSession/BackendSession.cpp b/timbre/lib/BackendSession/BackendSession.cpp
+index 8a35cf0..e4a9cbb 100644
+--- a/timbre/lib/BackendSession/BackendSession.cpp
++++ b/timbre/lib/BackendSession/BackendSession.cpp
+@@ -63,7 +63,8 @@ namespace BackendSession
+         MqttClient::onIaResponse(handleIaResponse);
+ 
+         // El stream RTSP (video + audio) tambien es transporte hacia el backend.
+-        RtspPublisher::initialize(Config::Media::HOST, video, audio, Config::Media::PATH);
++        RtspPublisher::initialize(Config::Media::HOST, Config::Media::USER, Config::Media::PASS,
++                                  video, audio);
+ 
+         Serial.println("[SESSION] configurada (MQTT + RTSP sin conectar aun)");
+     }
+@@ -113,15 +114,27 @@ namespace BackendSession
+         return true;
+     }
+ 
+-    bool iniciarMedia()
++    bool iniciarMedia(const String &id)
+     {
++        // Path que el gateway reconstruye: {RTSP_BASE}/{deviceId}/doorbell/{trackId}.
++        String path = deviceId + "/" + Config::Media::PATH + "/" + id;
+         // Negocia todos los tracks disponibles; el envio arranca apagado.
+-        bool ok = RtspPublisher::start();
++        bool ok = RtspPublisher::start(path);
+         if (!ok)
+             Serial.println("[SESSION] RTSP no arranco (el evento local sigue)");
+         return ok;
+     }
+ 
++    bool mediaLista()
++    {
++        return RtspPublisher::isPublishing();
++    }
++
++    bool mediaFallo()
++    {
++        return RtspPublisher::state() == RtspPublisher::State::Error;
++    }
++
+     void activarVideo(bool activo)
+     {
+         RtspPublisher::setVideoActivo(activo);
+@@ -152,8 +165,11 @@ namespace BackendSession
+     {
+         MqttClient::loop();
+ 
+-        // Mientras el stream publica, hay que bombearlo (manda video+audio RTP).
+-        if (RtspPublisher::isPublishing())
++        // Bombear el RTSP en TODOS los estados activos: loop() es el que avanza
++        // ANNOUNCE -> SETUP -> RECORD y despues manda video+audio. (Antes solo se
++        // llamaba en Publishing y la negociacion quedaba trabada en Announcing.)
++        RtspPublisher::State s = RtspPublisher::state();
++        if (s != RtspPublisher::State::Idle && s != RtspPublisher::State::Error)
+             RtspPublisher::loop();
+     }
+ 
+diff --git a/timbre/lib/BackendSession/BackendSession.h b/timbre/lib/BackendSession/BackendSession.h
+index 6cec3a2..9c16316 100644
+--- a/timbre/lib/BackendSession/BackendSession.h
++++ b/timbre/lib/BackendSession/BackendSession.h
+@@ -51,12 +51,19 @@ namespace BackendSession
+     // una constante hardcodeada de prueba, sin pasar por la fuente).
+     bool enviarFotoBase64(const String &trackId, const String &fotoBase64);
+ 
+-    // Arranca el stream RTSP hacia MediaMTX. Negocia todos los tracks con
+-    // fuente (video y audio quedan disponibles), pero NO envia nada todavia.
+-    // Se llama despues de que el press salio OK. El audio y el video NO se
+-    // mandan como blobs: van por RTSP y el gateway los extrae en chunks
+-    // (ExtractVideoChunk/ExtractAudioChunk). Devuelve true si el stream arranco.
+-    bool iniciarMedia();
++    // Arranca el stream RTSPS hacia MediaMTX en {deviceId}/doorbell/{trackId}.
++    // Negocia todos los tracks con fuente, pero NO envia nada todavia.
++    // Contrato: el path tiene que estar READY ANTES del press (si no, el PLAY
++    // del gateway da 404). Por eso EventFlow lo llama antes de enviarFoto y
++    // espera mediaLista(). El audio y el video van por RTSP y el gateway los
++    // extrae en chunks. Devuelve true si arranco la negociacion (TLS OK).
++    bool iniciarMedia(const String &trackId);
++
++    // true cuando MediaMTX acepto el RECORD (path ready para el PLAY del gateway).
++    bool mediaLista();
++
++    // true si la negociacion RTSP fallo (TLS, 401, SETUP...).
++    bool mediaFallo();
+ 
+     // Prende/apaga el envio de cada track EN VIVO (sin reconectar). Lo llama
+     // EventFlow segun su deteccion: audio cuando hay sonido, video cuando el
+diff --git a/timbre/lib/Config/Config.h b/timbre/lib/Config/Config.h
+index d1aeaca..83ad725 100644
+--- a/timbre/lib/Config/Config.h
++++ b/timbre/lib/Config/Config.h
+@@ -41,7 +41,20 @@
+ #define MEDIAMTX_HOST "192.168.1.69"
+ #endif
+ #ifndef MEDIAMTX_PORT
+-#define MEDIAMTX_PORT 8554
++#define MEDIAMTX_PORT 8322
++#endif
++// Igual que MQTT_TLS_HOSTNAME: MediaMTX usa el mismo server.pem (SAN IP) y el
++// mbedtls 2.28 del ESP32 no matchea SANs de tipo IP.
++#ifndef MEDIAMTX_TLS_HOSTNAME
++#define MEDIAMTX_TLS_HOSTNAME "localhost"
++#endif
++// User RTSP = deviceId (authInternalUsers en mediamtx.secure.yml). Solo puede
++// publicar en paths que empiezan con {deviceId}/.
++#ifndef MEDIAMTX_USER
++#define MEDIAMTX_USER DEVICE_ID
++#endif
++#ifndef MEDIAMTX_PASS
++#error "Falta -DMEDIAMTX_PASS en platformio.ini (pass RTSP del device en mediamtx.secure.yml)"
+ #endif
+ #ifndef MEDIAMTX_PATH
+ #define MEDIAMTX_PATH "doorbell"
+@@ -136,6 +149,9 @@ namespace Config
+     namespace Event
+     {
+         constexpr uint32_t BACKEND_CONNECT_TIMEOUT_MS = 10000;
++        // Cuanto esperar a que el RTSPS quede ready (TLS + ANNOUNCE/SETUP/RECORD)
++        // antes de mandar el press igual (solo IMAGE).
++        constexpr uint32_t RTSP_READY_TIMEOUT_MS = 8000;
+         constexpr uint32_t AUDIO_LEVEL_THROTTLE_MS = 120; // push nivel a Screen
+ 
+         // Con el stream local ya corriendo, cada cuanto se re-evalua si hay
+@@ -195,7 +211,10 @@ namespace Config
+     {
+         constexpr const char *HOST = MEDIAMTX_HOST;
+         constexpr uint16_t PORT = MEDIAMTX_PORT;
+-        constexpr const char *PATH = MEDIAMTX_PATH;
++        constexpr const char *PATH = MEDIAMTX_PATH; // segmento del medio: {deviceId}/doorbell/{trackId}
++        constexpr const char *TLS_HOSTNAME = MEDIAMTX_TLS_HOSTNAME;
++        constexpr const char *USER = MEDIAMTX_USER;
++        constexpr const char *PASS = MEDIAMTX_PASS;
+     }
+ 
+     // --- Gateway HTTP mTLS (ApiClient) --------------------------------------
+diff --git a/timbre/lib/EventFlow/EventFlow.cpp b/timbre/lib/EventFlow/EventFlow.cpp
+index f4a61b9..09e3f26 100644
+--- a/timbre/lib/EventFlow/EventFlow.cpp
++++ b/timbre/lib/EventFlow/EventFlow.cpp
+@@ -26,8 +26,9 @@ namespace
+     {
+         OFF,        // sin sesion de backend: con evento activo, re-evalua cada
+                     // EVAL_INTERVAL_MS si hay motivo (sonido/persona) para conectar
+-        CONECTANDO, // conectando al broker MQTT
+-        EN_SESION   // press enviado, publicando media
++        CONECTANDO,     // conectando al broker MQTT
++        ABRIENDO_MEDIA, // MQTT listo; negociando RTSPS (tiene que quedar ready ANTES del press)
++        EN_SESION       // press enviado, publicando media
+     };
+ 
+     MediaSource *src = nullptr;
+@@ -35,6 +36,7 @@ namespace
+     bool eventoActivo = false;
+     Backend backend = Backend::OFF;
+     unsigned long conectandoDesde = 0;
++    unsigned long mediaDesde = 0;
+     unsigned long ultimaEvaluacionMs = 0;
+     String trackId = "";
+ 
+@@ -229,6 +231,27 @@ namespace
+     }
+ }
+ 
++namespace
++{
++    // Publica el press (con la foto) y pasa a EN_SESION. Se llama con el RTSP
++    // ya ready o, si el RTSP fallo, igual: el gateway analiza al menos la IMAGE.
++    void enviarPress()
++    {
++        // Si todavia no hay foto (fallo la del timbre), sacamos una ahora.
++        if (fotoLen == 0)
++            capturarFoto();
++        if (!BackendSession::enviarFotoBase64(trackId, CameraSource::toBase64(foto, fotoLen)))
++        {
++            Serial.println("[FLOW] fallo el press: backend OFF, sigo evaluando (el evento local sigue)");
++            BackendSession::cerrarSesion(trackId); // frena el RTSP si habia quedado abierto
++            backend = Backend::OFF;
++            return;
++        }
++        Serial.printf("[FLOW] sesion de backend iniciada trackId=%s\n", trackId.c_str());
++        backend = Backend::EN_SESION;
++    }
++}
++
+ namespace EventFlow
+ {
+     void initialize(const String &deviceId, MediaSource *source)
+@@ -382,24 +405,17 @@ namespace EventFlow
+         {
+             if (BackendSession::estaListo())
+             {
+-                // Si todavia no hay foto (fallo la del timbre), sacamos una ahora.
+-                if (fotoLen == 0)
+-                    capturarFoto();
+-                if (!BackendSession::enviarFotoBase64(trackId, CameraSource::toBase64(foto, fotoLen)))
++                // Contrato: el path RTSP tiene que estar ready ANTES del press
++                // (si no, el PLAY del gateway da 404 y no hay VIDEO/AUDIO).
++                if (BackendSession::iniciarMedia(trackId))
+                 {
+-                    Serial.println("[FLOW] fallo el press: backend OFF, sigo evaluando (el evento local sigue)");
+-                    backend = Backend::OFF;
++                    mediaDesde = millis();
++                    backend = Backend::ABRIENDO_MEDIA;
+                 }
+                 else
+                 {
+-                    Serial.printf("[FLOW] sesion de backend iniciada trackId=%s\n", trackId.c_str());
+-                    backend = Backend::EN_SESION;
+-
+-                    // Negocia video+audio y prende de entrada lo que disparo la
+-                    // conexion. Lo que falta lo prende loop() al detectarlo.
+-                    BackendSession::iniciarMedia();
+-                    BackendSession::activarAudio(audioDetectado);
+-                    BackendSession::activarVideo(videoDetectado);
++                    Serial.println("[FLOW] RTSP no arranco: mando el press igual (solo IMAGE)");
++                    enviarPress();
+                 }
+             }
+             else if (millis() - conectandoDesde > Config::Event::BACKEND_CONNECT_TIMEOUT_MS)
+@@ -409,6 +425,27 @@ namespace EventFlow
+             }
+         }
+ 
++        if (backend == Backend::ABRIENDO_MEDIA)
++        {
++            if (BackendSession::mediaLista())
++            {
++                // Prender lo detectado ANTES del press: el gateway hace PLAY
++                // enseguida y MediaMTX corta al publisher que no manda datos en
++                // 10 s. Lo que falta lo prende loop() (EN_SESION) al detectarlo.
++                BackendSession::activarAudio(audioDetectado);
++                BackendSession::activarVideo(videoDetectado);
++                Serial.println("[FLOW] RTSP ready -> mando el press");
++                enviarPress();
++            }
++            else if (BackendSession::mediaFallo() ||
++                     millis() - mediaDesde > Config::Event::RTSP_READY_TIMEOUT_MS)
++            {
++                Serial.println("[FLOW] RTSP no quedo ready: mando el press igual (solo IMAGE)");
++                BackendSession::cerrarSesion(trackId); // frena el RTSP a medio negociar
++                enviarPress();
++            }
++        }
++
+         if (hangupPedido)
+         {
+             hangupPedido = false;
+diff --git a/timbre/lib/RtspPublisher/RtspPublisher.cpp b/timbre/lib/RtspPublisher/RtspPublisher.cpp
+index fee1979..912f255 100644
+--- a/timbre/lib/RtspPublisher/RtspPublisher.cpp
++++ b/timbre/lib/RtspPublisher/RtspPublisher.cpp
+@@ -1,8 +1,15 @@
+ #include "RtspPublisher.h"
+ #include "Config.h"
++#include "Certs.h" // CA_CERT: valida el server cert de MediaMTX
+ #include <WiFi.h>
+-#include <WiFiClient.h>
++#include <WiFiClientSecure.h>
+ #include <string.h>
++#include "mbedtls/base64.h"
++
++// Timeout del handshake TLS, en SEGUNDOS (WiFiClientSecure::setHandshakeTimeout).
++#ifndef RTSP_TLS_HANDSHAKE_TIMEOUT_S
++#define RTSP_TLS_HANDSHAKE_TIMEOUT_S 10
++#endif
+ 
+ #define RTP_PT_JPEG 26 // video JPEG (RFC 2435)
+ #define RTP_PT_PCMU 0  // audio G.711 u-law
+@@ -16,7 +23,9 @@ namespace
+ {
+     using State = RtspPublisher::State;
+ 
+-    WiFiClient tcp;
++    // RTSPS: TLS solo del lado del server (MediaMTX no pide client cert). La
++    // identidad va por user/pass (Basic) en cada request.
++    WiFiClientSecure tcp;
+     MediaSource *videoSrc = nullptr;
+     AudioSource *audioSrc = nullptr;
+     // "has*" = track NEGOCIADO (declarado en el SDP; su fuente existe). Fijo
+@@ -28,7 +37,8 @@ namespace
+     bool audioActivo = false;
+ 
+     String mtxHost;
+-    String mtxPath = "doorbell";
++    String mtxPath;    // {deviceId}/doorbell/{trackId}; se fija en start()
++    String authHeader; // "Authorization: Basic ...\r\n" (precalculado)
+ 
+     State st = State::Idle;
+     uint32_t cseq = 1;
+@@ -48,18 +58,37 @@ namespace
+ 
+     uint8_t pkt[MAX_RTP_PACKET + 8];
+ 
++    // Sin credenciales en la URL: van en el header Authorization.
+     String rtspUrl()
+     {
+-        return "rtsp://" + mtxHost + ":" + String(Config::Media::PORT) + "/" + mtxPath;
++        return "rtsps://" + mtxHost + ":" + String(Config::Media::PORT) + "/" + mtxPath;
++    }
++
++    String basicAuthHeader(const String &user, const String &pass)
++    {
++        String plain = user + ":" + pass;
++        size_t need = 0;
++        mbedtls_base64_encode(nullptr, 0, &need, (const uint8_t *)plain.c_str(), plain.length());
++        String out;
++        uint8_t *buf = (uint8_t *)malloc(need);
++        size_t written = 0;
++        if (buf && mbedtls_base64_encode(buf, need, &written,
++                                         (const uint8_t *)plain.c_str(), plain.length()) == 0)
++            out = "Authorization: Basic " + String((const char *)buf) + "\r\n";
++        free(buf);
++        return out;
+     }
+ 
+     // --- RTSP helpers -----------------------------------------------------
+-    void sendRequest(const String &method, const String &extraHeaders,
++    // Todos los requests llevan Authorization (Basic preventivo): MediaMTX usa
++    // rtspAuthMethods [basic] por defecto y valida en cada request.
++    void sendRequest(const String &method, const String &url, const String &extraHeaders,
+                      const String &body = "")
+     {
+-        String req = method + " " + rtspUrl() + " RTSP/1.0\r\n";
++        String req = method + " " + url + " RTSP/1.0\r\n";
+         req += "CSeq: " + String(cseq++) + "\r\n";
+         req += "User-Agent: timbre-esp32\r\n";
++        req += authHeader;
+         if (sessionId.length() > 0)
+             req += "Session: " + sessionId + "\r\n";
+         req += extraHeaders;
+@@ -91,6 +120,18 @@ namespace
+ 
+     bool responseOk(const String &resp) { return resp.startsWith("RTSP/1.0 200"); }
+ 
++    // Loguea la primera linea de una respuesta no-200 (401 = credenciales, 400
++    // = path/SDP, etc.) para no tener que adivinar.
++    void logBadResponse(const char *what, const String &resp)
++    {
++        int nl = resp.indexOf("\r\n");
++        String status = nl > 0 ? resp.substring(0, nl) : resp;
++        Serial.printf("[RTSP] %s respondio: %s\n", what, status.c_str());
++        if (resp.startsWith("RTSP/1.0 401"))
++            Serial.println("[RTSP] 401: user/pass rechazados o sin permiso de publish en ese path "
++                           "(ver authInternalUsers en mediamtx.secure.yml)");
++    }
++
+     String extractSession(const String &resp)
+     {
+         int idx = resp.indexOf("Session:");
+@@ -133,30 +174,18 @@ namespace
+ 
+     // SETUP de cada track. Incluyen Session solo si ya lo tenemos (el primer
+     // SETUP de la sesion todavia no lo tiene; el segundo si).
++    // RTP/AVP/TCP (no SAVP): con RTSPS + TCP interleaved el RTP ya viaja
++    // dentro del TLS; MediaMTX solo exige SAVP para UDP.
+     void sendSetupVideo()
+     {
+-        String url = rtspUrl() + "/streamid=0";
+-        String setup = "SETUP " + url + " RTSP/1.0\r\n";
+-        setup += "CSeq: " + String(cseq++) + "\r\n";
+-        if (sessionId.length() > 0)
+-            setup += "Session: " + sessionId + "\r\n";
+-        setup += "Transport: RTP/AVP/TCP;unicast;interleaved=0-1;mode=record\r\n";
+-        setup += "\r\n";
+-        tcp.print(setup);
+-        Serial.println("[RTSP] -> SETUP video (interleaved 0-1)");
++        sendRequest("SETUP", rtspUrl() + "/streamid=0",
++                    "Transport: RTP/AVP/TCP;unicast;interleaved=0-1;mode=record\r\n");
+     }
+ 
+     void sendSetupAudio()
+     {
+-        String url = rtspUrl() + "/streamid=1";
+-        String setup = "SETUP " + url + " RTSP/1.0\r\n";
+-        setup += "CSeq: " + String(cseq++) + "\r\n";
+-        if (sessionId.length() > 0)
+-            setup += "Session: " + sessionId + "\r\n";
+-        setup += "Transport: RTP/AVP/TCP;unicast;interleaved=2-3;mode=record\r\n";
+-        setup += "\r\n";
+-        tcp.print(setup);
+-        Serial.println("[RTSP] -> SETUP audio (interleaved 2-3)");
++        sendRequest("SETUP", rtspUrl() + "/streamid=1",
++                    "Transport: RTP/AVP/TCP;unicast;interleaved=2-3;mode=record\r\n");
+     }
+ 
+     void fail(const char *why)
+@@ -376,7 +405,11 @@ namespace
+         aTimestamp += len; // cada byte u-law = 1 sample a 8kHz
+ 
+         uint16_t rtpLen = (w - (pkt + 4));
+-        sendInterleaved(RTP_CHAN_AUDIO, pkt, rtpLen);
++        if (!sendInterleaved(RTP_CHAN_AUDIO, pkt, rtpLen))
++        {
++            fail("write RTP audio fallo");
++            return;
++        }
+ 
+         // Log cada ~50 chunks (~1s de audio) para confirmar que sale.
+         static uint32_t audioCount = 0;
+@@ -388,11 +421,12 @@ namespace
+ 
+ namespace RtspPublisher
+ {
+-    void initialize(const String &mediaMtxHost, MediaSource *source,
+-               AudioSource *audio, const String &path)
++    void initialize(const String &mediaMtxHost, const String &user, const String &pass,
++                    MediaSource *source, AudioSource *audio)
+     {
+         mtxHost = mediaMtxHost;
+-        mtxPath = path;
++        mtxPath = "";
++        authHeader = basicAuthHeader(user, pass);
+         videoSrc = source;
+         audioSrc = audio;
+         // hasVideo/hasAudio se deciden por evento en start(); aca solo guardamos
+@@ -400,13 +434,16 @@ namespace RtspPublisher
+         st = State::Idle;
+         vSsrc = esp_random();
+         aSsrc = esp_random();
+-        Serial.printf("[RTSP] configurado -> %s (fuentes: video %s, audio %s)\n",
+-                      rtspUrl().c_str(),
++        tcp.setHandshakeTimeout(RTSP_TLS_HANDSHAKE_TIMEOUT_S);
++        Serial.printf("[RTSP] configurado -> rtsps://%s:%d (user %s, tls-name %s, video %s, audio %s)\n",
++                      mtxHost.c_str(), Config::Media::PORT, user.c_str(),
++                      Config::Media::TLS_HOSTNAME,
+                       videoSrc ? "si" : "no", audioSrc ? "si" : "no");
+     }
+ 
+-    bool start()
++    bool start(const String &path)
+     {
++        mtxPath = path;
+         // Negociamos todos los tracks con fuente disponible; el envio arranca
+         // apagado y lo prende EventFlow cuando decide (deteccion).
+         hasVideo = (videoSrc != nullptr);
+@@ -420,12 +457,25 @@ namespace RtspPublisher
+             return false;
+         }
+ 
+-        Serial.printf("[RTSP] conectando a %s:%d... (negociando video %s, audio %s)\n",
+-                      mtxHost.c_str(), Config::Media::PORT,
+-                      hasVideo ? "si" : "no", hasAudio ? "si" : "no");
+-        if (!tcp.connect(mtxHost.c_str(), Config::Media::PORT))
++        Serial.printf("[RTSP] conectando a %s (negociando video %s, audio %s)...\n",
++                      rtspUrl().c_str(), hasVideo ? "si" : "no", hasAudio ? "si" : "no");
++
++        IPAddress ip;
++        if (!WiFi.hostByName(mtxHost.c_str(), ip))
+         {
+-            fail("no se pudo abrir TCP a MediaMTX");
++            fail("no se pudo resolver el host de MediaMTX");
++            return false;
++        }
++        // Handshake TLS (bloqueante, ~1-3 s). Se conecta a la IP pero valida el
++        // server cert contra TLS_HOSTNAME (mismo problema de SAN IP que MQTT).
++        tcp.stop();
++        if (!tcp.connect(ip, Config::Media::PORT, Config::Media::TLS_HOSTNAME,
++                         CA_CERT, nullptr, nullptr))
++        {
++            char err[128] = {0};
++            int code = tcp.lastError(err, sizeof(err));
++            Serial.printf("[RTSP] handshake TLS fallo (%d): %s\n", code, err);
++            fail("no se pudo abrir RTSPS a MediaMTX");
+             return false;
+         }
+ 
+@@ -433,7 +483,7 @@ namespace RtspPublisher
+         sessionId = "";
+         frameCount = 0;
+         st = State::Announcing;
+-        sendRequest("ANNOUNCE", "Content-Type: application/sdp\r\n", buildSdp());
++        sendRequest("ANNOUNCE", rtspUrl(), "Content-Type: application/sdp\r\n", buildSdp());
+         return true;
+     }
+ 
+@@ -442,7 +492,7 @@ namespace RtspPublisher
+         if (st == State::Idle)
+             return;
+         if (tcp.connected())
+-            sendRequest("TEARDOWN", "");
++            sendRequest("TEARDOWN", rtspUrl(), "");
+         tcp.stop();
+         st = State::Idle;
+         Serial.println("[RTSP] detenido (TEARDOWN)");
+@@ -493,6 +543,7 @@ namespace RtspPublisher
+             String resp = readResponse();
+             if (!responseOk(resp))
+             {
++                logBadResponse("ANNOUNCE", resp);
+                 fail("ANNOUNCE no-200");
+                 return;
+             }
+@@ -517,6 +568,7 @@ namespace RtspPublisher
+             String resp = readResponse();
+             if (!responseOk(resp))
+             {
++                logBadResponse("SETUP video", resp);
+                 fail("SETUP video no-200");
+                 return;
+             }
+@@ -534,7 +586,7 @@ namespace RtspPublisher
+             {
+                 // Solo video: directo a RECORD
+                 st = State::Recording;
+-                sendRequest("RECORD", "Range: npt=0.000-\r\n");
++                sendRequest("RECORD", rtspUrl(), "Range: npt=0.000-\r\n");
+             }
+             break;
+         }
+@@ -545,6 +597,7 @@ namespace RtspPublisher
+             String resp = readResponse();
+             if (!responseOk(resp))
+             {
++                logBadResponse("SETUP audio", resp);
+                 fail("SETUP audio no-200");
+                 return;
+             }
+@@ -556,7 +609,7 @@ namespace RtspPublisher
+                 sessionId = sid;
+ 
+             st = State::Recording;
+-            sendRequest("RECORD", "Range: npt=0.000-\r\n");
++            sendRequest("RECORD", rtspUrl(), "Range: npt=0.000-\r\n");
+             break;
+         }
+         case State::Recording:
+@@ -566,6 +619,7 @@ namespace RtspPublisher
+             String resp = readResponse();
+             if (!responseOk(resp))
+             {
++                logBadResponse("RECORD", resp);
+                 fail("RECORD no-200");
+                 return;
+             }
+@@ -586,6 +640,14 @@ namespace RtspPublisher
+                 return;
+             }
+ 
++            // MediaMTX manda RTCP (receiver reports) por el mismo socket. No lo
++            // usamos, pero hay que leerlo para que no se llene el buffer.
++            {
++                uint8_t sink[128];
++                while (tcp.available())
++                    tcp.read(sink, sizeof(sink));
++            }
++
+             // Video: a la cadencia del source. Solo si el track fue negociado
+             // Y esta activado en vivo (EventFlow decide).
+             if (hasVideo && videoActivo)
+diff --git a/timbre/lib/RtspPublisher/RtspPublisher.h b/timbre/lib/RtspPublisher/RtspPublisher.h
+index 3dd654e..d4da484 100644
+--- a/timbre/lib/RtspPublisher/RtspPublisher.h
++++ b/timbre/lib/RtspPublisher/RtspPublisher.h
+@@ -7,9 +7,15 @@
+ // build flag en platformio.ini. El host se pasa ademas como parametro a initialize().
+ 
+ // ---------------------------------------------------------------------------
+-// RtspPublisher: publica video y/o audio hacia MediaMTX por RTSP (push).
++// RtspPublisher: publica video y/o audio hacia MediaMTX por RTSPS (push).
+ //
+-// Dos tracks RTP interleaved sobre la misma conexion TCP:
++// Transporte: TLS contra MediaMTX (profile secure, :8322). El server cert se
++// valida con CA_CERT contra Config::Media::TLS_HOSTNAME. MediaMTX no pide client
++// cert: la identidad va por user/pass (Basic) en cada request, y solo deja
++// publicar en paths que empiezan con {deviceId}/.
++// Path por evento: {deviceId}/doorbell/{trackId} (lo arma BackendSession).
++//
++// Dos tracks RTP interleaved sobre la misma conexion TLS:
+ //   Track 0 (video): JPEG → RTP-JPEG (RFC 2435), canales 0-1
+ //   Track 1 (audio): G.711 u-law → RTP PCMU (payload 0), canales 2-3
+ //
+@@ -32,15 +38,16 @@ namespace RtspPublisher
+         Error
+     };
+ 
+-    void initialize(const String &mediaMtxHost, MediaSource *videoSource,
+-               AudioSource *audioSource = nullptr,
+-               const String &path = "doorbell");
++    void initialize(const String &mediaMtxHost, const String &user, const String &pass,
++                    MediaSource *videoSource, AudioSource *audioSource = nullptr);
+ 
+-    // Arranca la publicacion NEGOCIANDO todos los tracks con fuente disponible
+-    // (los declara en el SDP y hace el SETUP), pero SIN enviar nada todavia.
+-    // Que se envia realmente se prende/apaga en vivo con setVideoActivo() /
+-    // setAudioActivo(). Devuelve false si no hay ninguna fuente.
+-    bool start();
++    // Arranca la publicacion en `path` NEGOCIANDO todos los tracks con fuente
++    // disponible (SDP + SETUP), pero SIN enviar nada todavia. La negociacion
++    // avanza en loop(); cuando state() == Publishing el path esta "ready" en
++    // MediaMTX. Que se envia se prende/apaga con setVideoActivo()/setAudioActivo().
++    // OJO: MediaMTX corta al publisher si no recibe datos en readTimeout (10 s).
++    // Devuelve false si no hay fuentes o falla el TLS.
++    bool start(const String &path);
+     void stop();
+ 
+     // Prende/apaga el ENVIO de cada track en vivo, sin renegociar la sesion.
+diff --git a/timbre/platformio.ini b/timbre/platformio.ini
+index 4ff607e..8dd80ad 100644
+--- a/timbre/platformio.ini
++++ b/timbre/platformio.ini
+@@ -24,8 +24,15 @@ build_flags =
+     ; -DMQTT_BROKER_PORT=25076
+     ; -DMQTT_BROKER_HOST='"136.119.178.77"'
+     ; -DMQTT_BROKER_PORT=1883 
+-    -DMEDIAMTX_HOST='"192.168.1.69"'
+-    -DMEDIAMTX_PORT=8554
++    ; RTSPS contra MediaMTX de la VM (profile secure). User = DEVICE_ID.
++    -DMEDIAMTX_HOST='"34.27.42.246"'
++    -DMEDIAMTX_PORT=8322
++    -DMEDIAMTX_TLS_HOSTNAME='"localhost"'
++    ; pass del device en authInternalUsers (mediamtx.secure.yml)
++    -DMEDIAMTX_PASS='"fiuba-rtsp-writer-1"'
++    ; lab viejo (RTSP plano, ya no soportado por RtspPublisher):
++    ; -DMEDIAMTX_HOST='"192.168.1.69"'
++    ; -DMEDIAMTX_PORT=8554
+     ; -DAUDIO_TEST_MODE
+ 
+     -DMQTT_BUFFER_SIZE=200000
+@@ -66,5 +73,3 @@ build_flags =
+     -DSEED_WIFI_PASS='""'
+     ; 1 = el device ya figura registrado en el gateway; 0 = registra al vincular
+     -DSEED_WIFI_REGISTERED=1
+-    -DMEDIAMTX_HOST='"136.119.178.77"'
+-    -DMEDIAMTX_PORT=8554

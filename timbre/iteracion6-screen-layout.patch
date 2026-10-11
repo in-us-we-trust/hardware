@@ -1,0 +1,180 @@
+diff --git a/timbre/lib/Screen/Screen.cpp b/timbre/lib/Screen/Screen.cpp
+index 0ca5943..86edb39 100644
+--- a/timbre/lib/Screen/Screen.cpp
++++ b/timbre/lib/Screen/Screen.cpp
+@@ -15,7 +15,6 @@ namespace
+   // status: linea efimera (progreso / eventos locales).
+   // card:   resultado FIJO. Solo lo reemplaza un resultado de severidad igual o
+   //         mayor (gana el peor del evento).
+-  // hist:   ultimos HIST_MAX resultados (IA y locales), el mas nuevo al final.
+   struct Resultado
+   {
+     String text;
+@@ -23,13 +22,9 @@ namespace
+     String src;
+   };
+ 
+-  constexpr int HIST_MAX = 5;
+-
+   String lastStatus = "";
+   bool hayCard = false;
+   Resultado card;
+-  Resultado hist[HIST_MAX];
+-  int histCount = 0;
+ 
+   void (*hangupCb)() = nullptr;
+ 
+@@ -56,17 +51,11 @@ main{padding:16px 20px;display:flex;flex-direction:column;gap:16px;
+ #novideo{color:#6a7080;text-align:center;padding:40px;background:#171a21;
+  border-radius:10px;display:none;}
+ #viz{width:100%;height:48px;display:block;}
+-#log{display:flex;flex-direction:column;gap:8px;}
+-.msg{padding:10px 14px;border-radius:8px;background:#171a21;
+- border-left:4px solid #3a3f4b;white-space:pre-wrap;}
+-.msg .t{font-size:12px;color:#8a90a0;margin-bottom:2px;}
+-.sev-PELIGROSO{border-left-color:#e5484d;}
+-.sev-SOSPECHOSO{border-left-color:#f5a623;}
+-.sev-LLAMATIVO{border-left-color:#f2d600;}
+-.sev-NORMAL{border-left-color:#30a46c;}
+ #statusline{font-size:14px;color:#a8aebd;padding:8px 12px;background:#171a21;
+- border-radius:8px;min-height:18px;}
+-#statusline:before{content:'\25CF  ';color:#3e63dd;}
++ border-radius:8px;min-height:18px;display:flex;align-items:center;gap:8px;}
++#statusline .dot{width:8px;height:8px;border-radius:50%;background:#6a7080;
++ flex:none;animation:pulse 1.2s ease-in-out infinite;}
++@keyframes pulse{0%,100%{opacity:.3}50%{opacity:1}}
+ #card{padding:14px 16px;border-radius:10px;background:#1b1f28;
+  border-left:6px solid #3a3f4b;font-size:17px;font-weight:600;white-space:pre-wrap;}
+ #card .t{font-size:12px;color:#8a90a0;font-weight:400;margin-bottom:4px;}
+@@ -74,8 +63,6 @@ main{padding:16px 20px;display:flex;flex-direction:column;gap:16px;
+ #card.sev-SOSPECHOSO{border-left-color:#f5a623;}
+ #card.sev-LLAMATIVO{border-left-color:#f2d600;}
+ #card.sev-NORMAL{border-left-color:#30a46c;}
+-h3{font-size:12px;color:#6a7080;margin:4px 0 0;font-weight:600;
+- text-transform:uppercase;letter-spacing:.5px;}
+ #empty{color:#6a7080;padding:20px;}
+ </style></head><body>
+ <header>
+@@ -83,13 +70,11 @@ h3{font-size:12px;color:#6a7080;margin:4px 0 0;font-weight:600;
+   <button id='hangup'>Colgar</button>
+ </header>
+ <main>
++  <div id='card'><div id='empty'>Sin analisis todavia</div></div>
+   <img id='video' alt='stream'>
+   <div id='novideo'>Sin video (timbre en reposo)</div>
+   <canvas id='viz' height='48'></canvas>
+-  <div id='statusline'>Timbre en reposo</div>
+-  <div id='card'><div id='empty'>Sin analisis todavia</div></div>
+-  <h3>Historial</h3>
+-  <div id='log'></div>
++  <div id='statusline'><span class='dot'></span><span id='statustext'>Timbre en reposo</span></div>
+ </main>
+ <script>
+ var host = location.hostname;
+@@ -118,34 +103,21 @@ document.getElementById('hangup').onclick = function(){
+ };
+ 
+ // --- Mensajes (SSE) ---
+-// status: linea efimera. card: resultado fijo (lo decide el ESP32: gana el
+-// de mayor severidad). hist: todos los resultados, el mas nuevo arriba.
+-var HIST_MAX=5;
+-function hora(){ return new Date().toLocaleTimeString(); }
+-function head(o){
+-  var h=document.createElement('div'); h.className='t';
+-  h.textContent=hora()+' \u00b7 '+(o.src||'')+' \u00b7 '+(o.sev||'NORMAL');
+-  return h;
+-}
++// card: resultado fijo arriba del video (lo decide el ESP32: gana el de mayor
++// severidad del evento). status: lo que se esta haciendo, abajo, sin colores.
+ function setCard(o){
+   var c=document.getElementById('card');
+   c.className='sev-'+(o.sev||'NORMAL'); c.innerHTML='';
++  var h=document.createElement('div'); h.className='t';
++  h.textContent=new Date().toLocaleTimeString()+' \u00b7 '+(o.src||'')+' \u00b7 '+(o.sev||'NORMAL');
+   var b=document.createElement('div'); b.textContent=o.text||'';
+-  c.appendChild(head(o)); c.appendChild(b);
+-}
+-function addHist(o){
+-  var log=document.getElementById('log');
+-  var d=document.createElement('div'); d.className='msg sev-'+(o.sev||'NORMAL');
+-  var b=document.createElement('div'); b.textContent=o.text||'';
+-  d.appendChild(head(o)); d.appendChild(b);
+-  log.insertBefore(d, log.firstChild);
+-  while(log.children.length>HIST_MAX) log.removeChild(log.lastChild);
++  c.appendChild(h); c.appendChild(b);
+ }
++function setStatus(t){ document.getElementById('statustext').textContent=t; }
+ function limpiar(){
+-  document.getElementById('statusline').textContent='Timbre en reposo';
++  setStatus('Timbre en reposo');
+   var c=document.getElementById('card'); c.className='';
+   c.innerHTML='<div id="empty">Sin analisis todavia</div>';
+-  document.getElementById('log').innerHTML='';
+ }
+ var es=new EventSource('/events');
+ es.onmessage=function(e){
+@@ -153,8 +125,7 @@ es.onmessage=function(e){
+     var o=JSON.parse(e.data);
+     if(o.clear){ limpiar(); targetLevel=0; return; }
+     if(typeof o.level!=='undefined'){ targetLevel=o.level; return; }
+-    if(o.kind==='status'){ document.getElementById('statusline').textContent=o.text||''; return; }
+-    if(o.kind==='hist'){ addHist(o); return; }
++    if(o.kind==='status'){ setStatus(o.text||''); return; }
+     if(o.kind==='card'){ setCard(o); return; }
+   }catch(err){}
+ };
+@@ -267,8 +238,6 @@ drawViz();
+         "Access-Control-Allow-Origin: *\r\n"
+         "\r\n");
+     // La pagina pudo recargarse a mitad de evento: le re-mandamos todo.
+-    for (int i = 0; i < histCount; i++)
+-      pushResultado("hist", hist[i]);
+     if (hayCard)
+       pushResultado("card", card);
+     if (lastStatus.length() > 0)
+@@ -323,16 +292,6 @@ namespace Screen
+   {
+     Resultado r{text, severity.length() ? severity : String("NORMAL"), source};
+ 
+-    // Historial: siempre.
+-    if (histCount == HIST_MAX)
+-    {
+-      for (int i = 1; i < HIST_MAX; i++)
+-        hist[i - 1] = hist[i];
+-      histCount--;
+-    }
+-    hist[histCount++] = r;
+-    pushResultado("hist", r);
+-
+     // Tarjeta fija: solo si es igual o peor que la actual.
+     bool fija = !hayCard || rango(r.sev) >= rango(card.sev);
+     if (fija)
+@@ -349,7 +308,6 @@ namespace Screen
+   {
+     lastStatus = "";
+     hayCard = false;
+-    histCount = 0;
+     sseSend("{\"clear\":true}");
+     Serial.println("[SCREEN] limpio mensajes");
+   }
+diff --git a/timbre/lib/Screen/Screen.h b/timbre/lib/Screen/Screen.h
+index d3155bd..4da7069 100644
+--- a/timbre/lib/Screen/Screen.h
++++ b/timbre/lib/Screen/Screen.h
+@@ -11,13 +11,13 @@ namespace Screen
+     void showStatus(const String &text);
+ 
+     // RESULTADO de un analisis (IA del backend o tiny model / microfono local).
+-    // Siempre entra al historial (ultimos 5). La tarjeta fija solo cambia si la
+-    // severidad es igual o mayor a la que ya muestra: gana el peor del evento.
++    // Tarjeta fija arriba del video: solo cambia si la severidad es igual o
++    // mayor a la que ya muestra (gana el peor del evento).
+     // Severidades: NORMAL < LLAMATIVO < SOSPECHOSO < PELIGROSO.
+     // source: de donde sale, p.ej. "IA - Imagen" o "Local - Camara".
+     void showResult(const String &text, const String &severity, const String &source);
+ 
+-    // Limpia estado, tarjeta e historial (fin del evento).
++    // Limpia estado y tarjeta (fin del evento).
+     void clear();
+ 
+     // Empuja el nivel de audio (0..32767) a la pagina para la animacion.

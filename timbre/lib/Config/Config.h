@@ -25,20 +25,71 @@
 #define MQTT_BROKER_HOST "test.mosquitto.org"
 #endif
 #ifndef MQTT_BROKER_PORT
-#define MQTT_BROKER_PORT 1883
+#define MQTT_BROKER_PORT 8883
+#endif
+// Nombre contra el que se valida el server cert del broker (no tiene por que
+// ser MQTT_BROKER_HOST). El cert de la VM tiene SAN IP:34.27.42.246 y
+// DNS:localhost, pero el mbedtls 2.28 de Arduino-ESP32 2.x NO sabe matchear
+// SANs de tipo IP: validar contra la IP da "CN mismatch". Por eso se valida
+// contra "localhost" (la cadena igual se verifica contra nuestra CA privada).
+// Si se reemite server.pem con un DNS SAN propio (p. ej. mqtt.hogarseguro.local),
+// cambiar este flag a ese nombre.
+#ifndef MQTT_TLS_HOSTNAME
+#define MQTT_TLS_HOSTNAME "localhost"
 #endif
 #ifndef MEDIAMTX_HOST
 #define MEDIAMTX_HOST "192.168.1.69"
 #endif
 #ifndef MEDIAMTX_PORT
-#define MEDIAMTX_PORT 8554
+#define MEDIAMTX_PORT 8322
+#endif
+// Igual que MQTT_TLS_HOSTNAME: MediaMTX usa el mismo server.pem (SAN IP) y el
+// mbedtls 2.28 del ESP32 no matchea SANs de tipo IP.
+#ifndef MEDIAMTX_TLS_HOSTNAME
+#define MEDIAMTX_TLS_HOSTNAME "localhost"
+#endif
+// User RTSP = deviceId (authInternalUsers en mediamtx.secure.yml). Solo puede
+// publicar en paths que empiezan con {deviceId}/.
+#ifndef MEDIAMTX_USER
+#define MEDIAMTX_USER DEVICE_ID
+#endif
+#ifndef MEDIAMTX_PASS
+#error "Falta -DMEDIAMTX_PASS en platformio.ini (pass RTSP del device en mediamtx.secure.yml)"
 #endif
 #ifndef MEDIAMTX_PATH
 #define MEDIAMTX_PATH "doorbell"
 #endif
+// URL base del gateway (registro / events). http:// = sin TLS (manda el id en
+// X-Device-ID); https:// = mTLS con los certs del device. El host se resuelve
+// por DNS. Ojo: "localhost" en el ESP32 es el propio ESP32; para un gateway
+// local usar la IP de la PC en la LAN.
+// GATEWAY_TLS_HOSTNAME: nombre para SNI/validacion del cert y header Host
+// (solo https). Vacio = el host de GATEWAY_URL. Hace falta cuando la URL es
+// una IP (mismo tema de SANs IP que MQTT_TLS_HOSTNAME).
+#ifndef GATEWAY_URL
+#define GATEWAY_URL "https://34.120.207.250"
+#ifndef GATEWAY_TLS_HOSTNAME
+#define GATEWAY_TLS_HOSTNAME "api.hogarseguro.local"
+#endif
+#endif
+#ifndef GATEWAY_TLS_HOSTNAME
+#define GATEWAY_TLS_HOSTNAME ""
+#endif
+
+// --- Identidad del dispositivo ----------------------------------------------
+// Sin default a proposito: tiene que coincidir con el CN del certificado del
+// dispositivo (lib/Certs/certs/device.pem). Se define en platformio.ini.
+#ifndef DEVICE_ID
+#error "Falta -DDEVICE_ID en platformio.ini (tiene que ser el CN de device.pem)"
+#endif
 
 namespace Config
 {
+    namespace Identity
+    {
+        constexpr const char *ID = DEVICE_ID;
+    }
+
     // --- Entorno de build: hardware real vs. simulador Wokwi ----------------
     // Wokwi no simula camara, BLE ni modo AP. En vez de #ifdef WOKWI_SIM
     // repartidos por el codigo, un solo bool que se puede usar con "if" normal.
@@ -114,21 +165,41 @@ namespace Config
     namespace Event
     {
         constexpr uint32_t BACKEND_CONNECT_TIMEOUT_MS = 10000;
+        // Espera tras prender la camara antes de sacar la foto del press (los
+        // primeros frames salen oscuros).
+        constexpr uint32_t FOTO_WARMUP_MS = 1000;
+        // El audio y el video NO esperan el ia_response de la IMAGE del press.
+        // Si el press no se pudo publicar, se reintenta cada PRESS_RETRY_MS.
+        constexpr uint32_t PRESS_RETRY_MS = 2000;
+        // Despues del press, cada cuanto se saca una foto, se pasa por el tiny
+        // model y, SOLO si hay persona, se manda al backend (capture_image).
+        constexpr uint32_t CAPTURE_INTERVAL_MS = 5000;
+        // Solo una foto en analisis a la vez: la proxima captura espera el
+        // ia_response IMAGE de la anterior (press o captura). Si no llega en
+        // este tiempo, se sigue igual para no cortar las capturas.
+        constexpr uint32_t CAPTURE_RESPONSE_TIMEOUT_MS = 30000;
+        // Mensajes de "progreso" en la Screen: solo salen si la pantalla estuvo
+        // quieta este tiempo (no pisan enseguida un resultado de la IA).
+        constexpr uint32_t PROGRESO_ESPERA_MS = 2500; // esperando la respuesta del press
+        constexpr uint32_t PROGRESO_SESION_MS = 6000; // monitoreo / sesion en vivo
+        // Cuanto esperar a que el RTSPS quede ready (TLS + ANNOUNCE/SETUP/RECORD)
+        // antes de desistir; se reintenta tras MEDIA_RETRY_MS.
+        constexpr uint32_t RTSP_READY_TIMEOUT_MS = 8000;
+        constexpr uint32_t MEDIA_RETRY_MS = 5000;
         constexpr uint32_t AUDIO_LEVEL_THROTTLE_MS = 120; // push nivel a Screen
 
-        // Con el stream local ya corriendo, cada cuanto se re-evalua si hay
-        // motivo (sonido o persona) para CONECTAR al backend. El primer chequeo
-        // cae un intervalo despues del timbre, lo que da warm-up a camara/mic.
-        constexpr uint32_t EVAL_INTERVAL_MS = 1000;
-
-        // Cada cuanto EventFlow re-evalua que mandar por RTSP. Audio y video
-        // van a distinta frecuencia a proposito:
+        // Deteccion local durante la llamada. Audio y video van a distinta
+        // frecuencia a proposito:
         //  - Audio: leer el nivel del mic es baratisimo y un sonido corto no
         //    debe pasar entre chequeos, asi que se evalua seguido.
-        //  - Video: el tiny model es caro y comparte la camara con MJPEG/RTSP,
-        //    asi que se evalua espaciado.
+        //  - Persona: el tiny model es caro (~0.4 s) y comparte la camara con
+        //    MJPEG/RTSP; corre cada EVAL_INTERVAL_MS solo hasta ver a alguien
+        //    (despues lo sigue corriendo la captura cada CAPTURE_INTERVAL_MS).
         constexpr uint32_t AUDIO_DETECT_INTERVAL_MS = 50;
-        constexpr uint32_t VIDEO_DETECT_INTERVAL_MS = 500;
+        constexpr uint32_t EVAL_INTERVAL_MS = 1000;
+        // Si no hay sonido durante esta ventana, se apaga la pista de audio
+        // RTSP (el video sigue). Vuelve a prenderse apenas haya sonido.
+        constexpr uint32_t AUDIO_SILENCE_TIMEOUT_MS = 5000;
         // Umbral de nivel de microfono (0..32767) para considerar que "hay
         // sonido" y empezar a mandar audio. TODO: ajustar en campo (el gate de
         // ruido base de la pantalla ronda 800).
@@ -165,6 +236,7 @@ namespace Config
     {
         constexpr const char *BROKER_HOST = MQTT_BROKER_HOST;
         constexpr uint16_t BROKER_PORT = MQTT_BROKER_PORT;
+        constexpr const char *TLS_HOSTNAME = MQTT_TLS_HOSTNAME;
     }
 
     // --- MediaMTX / RTSP (BackendSession, RtspPublisher) -------------------
@@ -172,17 +244,24 @@ namespace Config
     {
         constexpr const char *HOST = MEDIAMTX_HOST;
         constexpr uint16_t PORT = MEDIAMTX_PORT;
-        constexpr const char *PATH = MEDIAMTX_PATH;
+        constexpr const char *PATH = MEDIAMTX_PATH; // segmento del medio: {deviceId}/doorbell/{trackId}
+        constexpr const char *TLS_HOSTNAME = MEDIAMTX_TLS_HOSTNAME;
+        // Copia propia del frame que manda RtspPublisher (PSRAM). Mismo tope que MJPEG.
+        constexpr size_t FRAME_BUF_SIZE = 100 * 1024;
+        constexpr const char *USER = MEDIAMTX_USER;
+        constexpr const char *PASS = MEDIAMTX_PASS;
     }
 
-    // --- Gateway HTTP mTLS (ApiClient) --------------------------------------
+    // --- Gateway HTTP/HTTPS (ApiClient) -------------------------------------
     namespace Api
     {
-        constexpr const char *GATEWAY_HOST = "api.hogarseguro.local"; // SNI/TLS
-        // IP publica del gateway (el host .local no resuelve por DNS).
-        constexpr uint8_t GATEWAY_IP[4] = {34, 120, 207, 250};
-        constexpr uint16_t GATEWAY_PORT = 443;
+        constexpr const char *URL = GATEWAY_URL;
+        constexpr const char *TLS_HOSTNAME = GATEWAY_TLS_HOSTNAME;
         constexpr uint32_t TLS_TIMEOUT_MS = 15000;
+        // Registro del dispositivo durante la vinculacion: si fallan todos los
+        // intentos, se descarta el WiFi recibido (no queda a medio vincular).
+        constexpr int REGISTER_ATTEMPTS = 3;
+        constexpr uint32_t REGISTER_RETRY_MS = 2000;
         constexpr const char *PATH_DEVICES = "/api/v1/devices";
         constexpr const char *PATH_EVENTS = "/api/v1/events";
     }

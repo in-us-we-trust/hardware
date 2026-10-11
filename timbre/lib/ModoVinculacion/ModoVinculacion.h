@@ -9,7 +9,8 @@
 // ---------------------------------------------------------------------------
 namespace ModoVinculacion
 {
-    // Levanta camara (en hardware real), portal web y BLE.
+    // Levanta portal web y BLE (en hardware real). Al terminar la vinculacion
+    // BleManager reinicia y el boot entra en Modo::Operacion.
     void begin(const String &bleName);
 
     // Una vuelta: atiende el portal y el trabajo diferido de BLE.

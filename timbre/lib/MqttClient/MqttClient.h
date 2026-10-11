@@ -3,87 +3,43 @@
 
 // ---------------------------------------------------------------------------
 // MqttClient: plano de control del timbre contra el gateway-microcontroller.
+// Contrato: gateway-microcontroller/docs/contrato-esp32.md
 //
-// Publica (el gateway escucha):
-//   - home/doorbell/events/press          (inicio de llamada)          QoS 1
-//   - home/doorbell/events/stream_end     (cierre de sesion)           QoS 1
-//   - home/doorbell/events/capture_image  (captura on-demand, opc.)    QoS 1
-//   - home/doorbell/events/capture_audio  (captura on-demand, opc.)    QoS 1
+// Transporte: MQTTS con mTLS (Mosquitto, profile "secure", puerto 8883).
+//   - El timbre presenta DEVICE_CERT/DEVICE_KEY (lib/Certs). Mosquitto usa el
+//     CN del cert como username (use_identity_as_username) y el ACL solo deja
+//     tocar home/<CN>/#. Por eso deviceId == CN (ver Device::certMatchesDeviceId).
+//   - El server cert se valida contra CA_CERT y contra el nombre
+//     Config::Mqtt::TLS_HOSTNAME (ver Config.h: por que no la IP).
 //
-// Se suscribe (el gateway publica):
-//   - home/doorbell/events/ia_response    (instruccion post-analisis)  QoS 1
+// Topicos (la identidad va SOLO en el topico, nunca en el JSON):
+//   Publica (QoS 1, sin retain):
+//     home/{deviceId}/events/{trackId}/press
+//     home/{deviceId}/events/{trackId}/stream_start  (RTSP publicando; ver abajo)
+//     home/{deviceId}/events/{trackId}/stream_end
+//     home/{deviceId}/events/{trackId}/capture_image   (opcional)
+//     home/{deviceId}/events/{trackId}/capture_audio   (opcional)
+//   Se suscribe (QoS 1):
+//     home/{deviceId}/events/+/ia_response
+//     (wildcard SOLO en el trackId de este device; el trackId se saca del
+//      topico y BackendSession filtra por la sesion activa)
 //
-// Reglas del contrato que respeta este modulo:
-//   - QoS 1 y sin retain en todo.
-//   - deviceId estable (Device::getOrCreateDeviceId), eventId nuevo por llamada.
-//   - eventId del press == trackId de toda la sesion; vuelve en ia_response y va
-//     en stream_end.
-//   - El JSON es UTF-8 valido (ArduinoJson). No se manda media binaria por MQTT.
+// Payloads (JSON compacto UTF-8):
+//   press:       {"event":"press","timestamp":<ms>,"image":"<b64>","batteryPercentage":<f>}
+//                timestamp/image/batteryPercentage son opcionales.
+//   stream_start:{"timestamp":<ms>}  el RTSP de este trackId ya esta publicando.
+//                (El press ya NO implica RTSP: se abre solo si hay persona/sonido.)
+//   stream_end:  {"timestamp":<ms>}
+//   capture_image: {"timestamp":<ms>,"image":"<base64 JPEG>"}
+//   capture_audio: {"timestamp":<ms>}
+//   ia_response (entrada):
+//                {"messageId":"<uuid>","chunkType":"IMAGE|VIDEO|AUDIO",
+//                 "action":"CONTINUE|STOP_DANGER","severity":"...","message":"..."}
+//                Un messageId repetido es reentrega QoS 1: se descarta.
 //
-// El broker en el lab es plano (tcp://host:1883, sin TLS ni auth). El mTLS del
-// proyecto es solo para el ApiClient HTTPS, no para MQTT.
-//
-// ===========================================================================
-// PAYLOADS EXACTOS (lo que sale del cable, tal cual lo arma este modulo)
-// ===========================================================================
-// Todos los payloads son un unico objeto JSON UTF-8, sin espacios ni saltos
-// (serializeJson compacto), publicado con QoS 1 y retain=false.
-//
-// Campos comunes:
-//   deviceId   string  - Device::getOrCreateDeviceId(). Siempre presente.
-//   timestamp  int64   - epoch en MILISEGUNDOS UTC. SE OMITE si el reloj no
-//                        esta sincronizado por NTP (time(nullptr) < 2020-09).
-//                        O sea: el gateway no puede asumir que exista.
-//
-// --- home/doorbell/events/press --------------------------------------------
-// Lo publica publishPress(). Campos:
-//   eventId            string  - id de esta llamada; ES el trackId de la sesion.
-//   deviceId           string
-//   event              string  - literal constante "press".
-//   rtspUrl            string  - siempre presente (puede venir vacio si el
-//                                llamador pasa ""); no se valida aca.
-//   timestamp          int64   - opcional (ver arriba).
-//   image              string  - opcional; JPEG en Base64 SIN prefijo data:.
-//                                Solo si imageBase64 != "". Ojo MQTT_BUFFER_SIZE.
-//   batteryPercentage  float   - opcional; solo si no es NAN.
-//
-// {"eventId":"evt-7f3a","deviceId":"esp32-a1b2c3","event":"press",
-//  "rtspUrl":"rtsp://192.168.0.42:8554/timbre","timestamp":1756512000000,
-//  "batteryPercentage":87.5}
-//
-// --- home/doorbell/events/stream_end ---------------------------------------
-// Lo publica publishStreamEnd(). Campos:
-//   trackId    string  - == eventId del press de esta sesion.
-//   deviceId   string
-//   timestamp  int64   - opcional.
-// NO lleva "event" ni "rtspUrl".
-//
-// {"trackId":"evt-7f3a","deviceId":"esp32-a1b2c3","timestamp":1756512045000}
-//
-// --- home/doorbell/events/capture_image ------------------------------------
-// --- home/doorbell/events/capture_audio ------------------------------------
-// Los publican publishCaptureImage() / publishCaptureAudio(). Mismo shape los
-// dos, cambia solo el topic. Campos:
-//   deviceId   string  - unico obligatorio.
-//   trackId    string  - opcional; solo si se paso != "".
-//   rtspUrl    string  - opcional; solo si se paso != "".
-//   timestamp  int64   - opcional.
-// NO llevan "event". El payload minimo posible es {"deviceId":"..."}.
-//
-// {"deviceId":"esp32-a1b2c3","trackId":"evt-7f3a",
-//  "rtspUrl":"rtsp://192.168.0.42:8554/timbre","timestamp":1756512010000}
-//
-// --- home/doorbell/events/ia_response (ENTRADA, no lo publicamos) ----------
-// Se espera un objeto con: trackId, deviceId, chunkType, action, severity,
-// message (todos string). Los que falten quedan como "" en IaResponse. Si el
-// deviceId viene y no es el nuestro, el mensaje se descarta sin llamar al
-// handler.
-//
-// {"trackId":"evt-7f3a","deviceId":"esp32-a1b2c3","chunkType":"IMAGE",
-//  "action":"CONTINUE","severity":"NORMAL","message":"Persona conocida"}
-//
-// Nota: si no hay conexion al broker, el publish se descarta (se loguea y
-// devuelve false); no hay cola local ni reintento del mensaje.
+// timestamp = epoch ms UTC; se omite si el reloj no esta sincronizado (NTP).
+// Si no hay conexion al broker, el publish se descarta (se loguea y devuelve
+// false); no hay cola local ni reintento del mensaje.
 // ---------------------------------------------------------------------------
 
 namespace MqttClient
@@ -91,26 +47,24 @@ namespace MqttClient
     // Instruccion recibida del gateway (ia_response ya parseada).
     struct IaResponse
     {
-        String trackId;   // == eventId del press de esta sesion
-        String deviceId;  // el de este dispositivo
+        String trackId;   // sacado del topico (== eventId del press)
+        String messageId; // unico por publicacion del gateway
         String chunkType; // "IMAGE" | "VIDEO" | "AUDIO"
         String action;    // "CONTINUE" | "STOP_DANGER"
-        String severity;  // "NORMAL" | "LOW" | "MEDIUM" | "HIGH"
+        String severity;  // finalSeverity del orquestador (p. ej. "PELIGROSO")
         String message;   // texto para UI / log / TTS
 
         bool isStopDanger() const { return action == "STOP_DANGER"; }
         bool isContinue() const { return action == "CONTINUE"; }
     };
 
-    // Callback que se invoca por cada ia_response cuyo deviceId coincide con el
-    // nuestro. El filtrado por trackId (llamadas solapadas) lo hace el llamador.
+    // Callback por cada ia_response de ESTE device. El filtrado por trackId
+    // (sesion activa) lo hace el llamador.
     typedef void (*IaResponseHandler)(const IaResponse &response);
 
-    // Configura el cliente. deviceId se usa para filtrar ia_response y para
-    // derivar un clientId unico ("timbre-<deviceId>"). No conecta todavia:
-    // la conexion se maneja de forma perezosa en loop().
-    //   host: IP/hostname del broker alcanzable por el ESP32 y el gateway.
-    //   port: 1883 tipico.
+    // Configura el cliente. deviceId arma los topicos y el clientId
+    // ("timbre-<deviceId>"). No conecta todavia: eso lo dispara conectar().
+    //   host: IP o hostname del broker. port: 8883 (MQTTS).
     void initialize(const String &host, uint16_t port, const String &deviceId);
 
     // Registra el handler de ia_response. Opcional.
@@ -120,16 +74,15 @@ namespace MqttClient
     // mensajes entrantes. Llamar en cada vuelta del loop() principal.
     void loop();
 
-    // true si hay sesion MQTT activa con el broker (TCP+CONNECT).
+    // true si hay sesion MQTT activa con el broker (TLS+CONNECT).
     bool connected();
 
-    // Dispara la conexion al broker (no bloquea). El resultado se resuelve en
-    // loop(). Antes de esto, initialize() solo configura pero no conecta.
+    // Dispara la conexion al broker. OJO: el handshake TLS es bloqueante
+    // (~1-3 s con RSA 2048); el stream local corre en el otro core.
     void conectar();
 
-    // Deja de reintentar y cierra la conexion si estaba abierta. Se vuelve a
-    // intentar con el proximo conectar(). Tambien se auto-invoca internamente
-    // tras MQTT_MAX_CONNECT_ATTEMPTS fallos, para no trabar el stream local.
+    // Deja de reintentar y cierra la conexion si estaba abierta. Tambien se
+    // auto-invoca tras MQTT_MAX_CONNECT_ATTEMPTS fallos seguidos.
     void desconectar();
 
     // true cuando esta LISTO para publicar/recibir: conectado Y suscripto a
@@ -138,24 +91,27 @@ namespace MqttClient
 
     // --- Publicaciones (todas QoS 1, sin retain) ---------------------------
 
-    // press: inicio de llamada. El eventId ES el trackId de la sesion.
-    //   rtspUrl: URL que el gateway puede reproducir (rtsp:// o rtsps://). No
-    //            puede ser 127.0.0.1 si el gateway corre en otro host.
-    //   imageBase64: JPEG en Base64. Opcional; si se omite el gateway saca un
-    //                frame por RTSP. Recomendado dejarlo vacio para no inflar
-    //                el payload (y subir el buffer si se decide mandarlo).
+    // press: inicio de llamada. trackId (== eventId) lo genera EventFlow.
+    //   imageBase64: JPEG en Base64 (opcional; si falta, el gateway saca un
+    //                frame por RTSP). Ojo MQTT_BUFFER_SIZE.
     //   batteryPercentage: informativo; NAN para omitirlo.
-    // Devuelve true si el publish salio (token OK). No confirma entrega end-to-end.
-    bool publishPress(const String &eventId,
-                      const String &rtspUrl,
+    // Devuelve true si el publish salio. No confirma entrega end-to-end.
+    bool publishPress(const String &trackId,
                       const String &imageBase64 = "",
                       float batteryPercentage = NAN);
 
-    // stream_end: el ESP32 deja de publicar RTSP. trackId == eventId del press.
+    // stream_start: el RTSP de trackId esta publicando (el gateway puede PLAY).
+    bool publishStreamStart(const String &trackId);
+
+    // stream_end: cierre de la llamada trackId.
     bool publishStreamEnd(const String &trackId);
 
-    // Captura on-demand (opcional, no es el flujo de timbre). Si hay sesion
-    // activa se pueden omitir trackId y rtspUrl; si no, hacen falta ambos.
-    bool publishCaptureImage(const String &trackId = "", const String &rtspUrl = "");
-    bool publishCaptureAudio(const String &trackId = "", const String &rtspUrl = "");
+    // capture_image: foto adicional de la llamada trackId (despues del press).
+    //   imageBase64: JPEG en Base64, igual que en el press. El gateway la manda
+    //                al detective-manager como IMAGE y responde por ia_response.
+    //                Requiere la sesion abierta por el press.
+    bool publishCaptureImage(const String &trackId, const String &imageBase64 = "");
+
+    // capture_audio: on-demand (opcional, el gateway lo saca del RTSP).
+    bool publishCaptureAudio(const String &trackId);
 }

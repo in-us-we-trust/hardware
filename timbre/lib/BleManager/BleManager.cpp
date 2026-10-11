@@ -4,7 +4,7 @@
 #include "Device.h"
 #include "Storage.h"
 #include "ApiClient.h"
-#include "CameraSource.h"
+#include "Config.h"
 
 #include <BLEDevice.h>
 #include <BLEServer.h>
@@ -29,9 +29,16 @@ namespace
     String pendingSsid;
     String pendingPassword;
     String bootTimestamp;
-    bool gatewayReady = false;
     bool awaitingRegistrationConfirmation = false;
-    unsigned long lastEventSentAt = 0;
+
+    // Vinculacion terminada: reinicia y main.cpp arranca en Modo::Operacion
+    // (hay WiFi guardado). Asi se libera BLE/AP/portal sin desarmarlos a mano.
+    void restartIntoOperacion()
+    {
+        WebPortal::sendSSE("Reiniciando en modo operacion...");
+        delay(1000); // deja salir el SSE / notify BLE
+        ESP.restart();
+    }
 
     // -----------------------------------------------------------------------
     // Callback: maneja conexion/desconexion BLE
@@ -82,10 +89,7 @@ namespace
                 WebPortal::sendSSE("Dispositivo vinculado!");
                 Storage::saveDeviceRegistered(true);
                 awaitingRegistrationConfirmation = false;
-                gatewayReady = true;
-                delay(500);
-                BleManager::stop();
-                WebPortal::stop();
+                restartIntoOperacion();
             }
             else
             {
@@ -127,8 +131,8 @@ namespace
 
             WebPortal::sendSSE("Credenciales recibidas, conectando...");
 
-            Storage::saveWifiCredentials(pendingSsid, pendingPassword);
-
+            // Las credenciales se guardan recien en loop(), si el WiFi conecta
+            // y el registro en el gateway sale bien.
             // Señal para que loop() (tarea principal) haga el trabajo pesado.
             pendingWifiConnect = true;
         }
@@ -176,38 +180,7 @@ namespace BleManager
     void loop()
     {
         if (!pendingWifiConnect)
-        {
-            if (!gatewayReady)
-            {
-                return;
-            }
-
-            if (millis() - lastEventSentAt < 30000)
-            {
-                return;
-            }
-
-            lastEventSentAt = millis();
-            String imageBase64 = Camera.captureBase64();
-            if (imageBase64.isEmpty())
-            {
-                WebPortal::sendSSE(" No se pudo capturar imagen para events");
-                return;
-            }
-
-            String apiResponse;
-            bool sent = ApiClient::sendEvent("motion", imageBase64, &apiResponse);
-            if (sent)
-            {
-                WebPortal::sendSSE("Event enviado al gateway");
-            }
-            else
-            {
-                WebPortal::sendSSE("Fallo el envio del event");
-            }
-
             return;
-        }
 
         // Consumimos el pedido primero para no reprocesarlo si algo tarda.
         pendingWifiConnect = false;
@@ -218,17 +191,7 @@ namespace BleManager
 
         if (WifiManager::connect(ssid, password))
         {
-            String deviceId = Device::getOrCreateDeviceId();
-            String mac = WiFi.macAddress();
-            String response = "{\"deviceId\":\"" + deviceId + "\",\"mac\":\"" + mac + "\"}";
             WebPortal::sendSSE("Conectado! RED: " + ssid + " | Registrando en el gateway...");
-
-            if (pCharacteristicWifi != nullptr)
-            {
-                pCharacteristicWifi->setValue(response.c_str());
-                pCharacteristicWifi->notify();
-            }
-
             String lastSeen = WifiManager::nowIso();
             if (bootTimestamp.isEmpty())
             {
@@ -239,28 +202,42 @@ namespace BleManager
             bool registered = deviceAlreadyRegistered;
             String apiResponse;
 
-            if (!deviceAlreadyRegistered)
+            for (int intento = 1; !registered && intento <= Config::Api::REGISTER_ATTEMPTS; intento++)
             {
+                if (intento > 1)
+                {
+                    WebPortal::sendSSE("Reintentando registro en el gateway (" + String(intento) + "/" +
+                                       String(Config::Api::REGISTER_ATTEMPTS) + ")...");
+                    delay(Config::Api::REGISTER_RETRY_MS);
+                }
                 registered = ApiClient::registerDevice(
                     Device::getBleName(),
                     lastSeen,
                     bootTimestamp,
                     "", -1, "", "",
                     &apiResponse);
-
-                if (registered)
-                {
-                    Storage::saveDeviceRegistered(true);
-                }
             }
 
             if (registered)
             {
+                // Recien aca queda guardado: WiFi OK + dispositivo registrado.
+                Storage::saveWifiCredentials(ssid, password);
+                if (!deviceAlreadyRegistered)
+                    Storage::saveDeviceRegistered(true);
+
+                String deviceId = Device::getDeviceId();
+                String mac = WiFi.macAddress();       
+                String response = "{\"deviceId\":\"" + deviceId + "\",\"mac\":\"" + mac + "\"}";
+                if (pCharacteristicWifi != nullptr)
+                {
+                    pCharacteristicWifi->setValue(response.c_str());
+                    pCharacteristicWifi->notify();
+                }
+
                 if (deviceAlreadyRegistered)
                 {
-                    gatewayReady = true;
-                    lastEventSentAt = millis() - 30000;
-                    WebPortal::sendSSE("Dispositivo ya registrado. Enviando events...");
+                    WebPortal::sendSSE("Dispositivo ya registrado.");
+                    restartIntoOperacion();
                 }
                 else
                 {
@@ -270,11 +247,22 @@ namespace BleManager
             }
             else
             {
-                WebPortal::sendSSE("WiFi OK pero fallo el registro en el gateway.");
+                // No queda a medio vincular: se descarta el WiFi recibido.
+                Storage::clearWifiCredentials();
+                WiFi.disconnect(false, true); // solo STA; el AP del portal sigue
+                WebPortal::sendSSE("Fallo el registro en el gateway tras " +
+                                   String(Config::Api::REGISTER_ATTEMPTS) +
+                                   " intentos. Volve a intentar la vinculacion.");
+                if (pCharacteristicWifi != nullptr)
+                {
+                    pCharacteristicWifi->setValue("{\"error\":\"register_failed\"}");
+                    pCharacteristicWifi->notify();
+                }
             }
         }
         else
         {
+            WiFi.disconnect(false, true);
             WebPortal::sendSSE("No se pudo conectar. Verificá las credenciales.");
             if (pCharacteristicWifi != nullptr)
             {

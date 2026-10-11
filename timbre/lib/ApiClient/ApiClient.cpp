@@ -1,44 +1,116 @@
 #include "ApiClient.h"
 #include "Certs.h"
 #include "Config.h"
+#include "Device.h"
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <ArduinoJson.h>
 
 namespace
 {
-    // Gateway (host/IP/puerto): definidos en Config::Api. La IP se arma aca
-    // como IPAddress a partir de los 4 octetos (IPAddress no es constexpr).
-    const char *GATEWAY_HOST = Config::Api::GATEWAY_HOST;
-    const IPAddress GATEWAY_IP(Config::Api::GATEWAY_IP[0], Config::Api::GATEWAY_IP[1],
-                              Config::Api::GATEWAY_IP[2], Config::Api::GATEWAY_IP[3]);
-    const uint16_t GATEWAY_PORT = Config::Api::GATEWAY_PORT;
+    // Gateway: Config::Api::URL partida en esquema/host/puerto/path base.
+    struct Endpoint
+    {
+        bool https = true;
+        String host;
+        uint16_t port = 443;
+        String basePath; // sin '/' final ("" o "/algo")
+    };
+
+    Endpoint parseUrl(String url)
+    {
+        Endpoint e;
+        if (url.startsWith("http://"))
+        {
+            e.https = false;
+            e.port = 80;
+            url = url.substring(7);
+        }
+        else if (url.startsWith("https://"))
+            url = url.substring(8);
+
+        int slash = url.indexOf('/');
+        String hostPort = slash >= 0 ? url.substring(0, slash) : url;
+        e.basePath = slash >= 0 ? url.substring(slash) : "";
+        while (e.basePath.endsWith("/"))
+            e.basePath.remove(e.basePath.length() - 1);
+
+        int colon = hostPort.indexOf(':');
+        if (colon >= 0)
+        {
+            e.host = hostPort.substring(0, colon);
+            e.port = hostPort.substring(colon + 1).toInt();
+        }
+        else
+            e.host = hostPort;
+        return e;
+    }
+
+    const Endpoint &gateway()
+    {
+        static Endpoint e = parseUrl(Config::Api::URL);
+        return e;
+    }
 
     // Solo se usa si llaman a ApiClient::setDeviceIdHeader() (mTLS apagado).
     String deviceIdHeaderOverride = "";
 
     bool doPost(const String &path, const String &jsonBody, String *responseBody, bool acceptConflict)
 {
-    WiFiClientSecure client;
+    const Endpoint &gw = gateway();
+    WiFiClientSecure secureClient;
+    WiFiClient plainClient;
+    WiFiClient &client = gw.https ? static_cast<WiFiClient &>(secureClient) : plainClient;
+    String hostHeader = gw.host;
+    String fullPath = gw.basePath + path;
+      
+    Serial.printf("[ApiClient] POST %s://%s:%u%s\n", gw.https ? "https" : "http",
+                  gw.host.c_str(), gw.port, fullPath.c_str());
 
-    // TIMEOUT: Evita cortes a mitad del handshake mTLS
-    client.setTimeout(Config::Api::TLS_TIMEOUT_MS);
-    client.setHandshakeTimeout(Config::Api::TLS_TIMEOUT_MS);
-    client.setCACert(CA_CERT);
-    client.setCertificate(DEVICE_CERT);
-    client.setPrivateKey(DEVICE_KEY);
-
-    String url = "https://" + String(GATEWAY_IP.toString().c_str()) + path;
-
-    if (!client.connect(GATEWAY_IP, GATEWAY_PORT, GATEWAY_HOST, CA_CERT, DEVICE_CERT, DEVICE_KEY))
+    if (gw.https)
     {
-        Serial.println("[ApiClient] No se pudo iniciar la conexion HTTPS");
-        return false;
+        // TIMEOUT: Evita cortes a mitad del handshake mTLS
+        secureClient.setTimeout(Config::Api::TLS_TIMEOUT_MS);
+        secureClient.setHandshakeTimeout(Config::Api::TLS_TIMEOUT_MS);
+        secureClient.setCACert(CA_CERT);
+        secureClient.setCertificate(DEVICE_CERT);
+        secureClient.setPrivateKey(DEVICE_KEY);
+
+        // SNI / validacion del cert: TLS_HOSTNAME si esta, si no el host de la URL.
+        if (strlen(Config::Api::TLS_HOSTNAME) > 0)
+            hostHeader = Config::Api::TLS_HOSTNAME;
+
+        IPAddress ip;
+        if (!WiFi.hostByName(gw.host.c_str(), ip))
+        {
+            Serial.println("[ApiClient] No se pudo resolver " + gw.host);
+            return false;
+        }
+        if (!secureClient.connect(ip, gw.port, hostHeader.c_str(), CA_CERT, DEVICE_CERT, DEVICE_KEY))
+        {
+            Serial.println("[ApiClient] No se pudo iniciar la conexion HTTPS");
+            return false;
+        }
+    }
+    else
+    {
+        plainClient.setTimeout(Config::Api::TLS_TIMEOUT_MS / 1000); // en segundos
+        if (!plainClient.connect(gw.host.c_str(), gw.port))
+        {
+            Serial.println("[ApiClient] No se pudo iniciar la conexion HTTP");
+            return false;
+        }
     }
 
-    if (deviceIdHeaderOverride.length() > 0)
+    // Sin TLS el gateway no tiene el cert para sacar el id: va en X-Device-ID.
+    String deviceIdHeader = deviceIdHeaderOverride;
+    if (deviceIdHeader.length() == 0 && !gw.https)
+        deviceIdHeader = Device::getDeviceId();
+
+    if (deviceIdHeader.length() > 0)
+
     {
-        Serial.println("[ApiClient] header X-Device-ID: " + deviceIdHeaderOverride);
+        Serial.println("[ApiClient] header X-Device-ID: " + deviceIdHeader);
     }
     else
     {
@@ -48,16 +120,16 @@ namespace
     String request;
     request.reserve(jsonBody.length() + 256);
     request += "POST ";
-    request += path;
+    request += fullPath;
     request += " HTTP/1.1\r\nHost: ";
-    request += GATEWAY_HOST;
+    request += hostHeader;
     request += "\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: ";
     request += String(jsonBody.length());
     request += "\r\n";
-    if (deviceIdHeaderOverride.length() > 0)
+    if (deviceIdHeader.length() > 0)
     {
         request += "X-Device-ID: ";
-        request += deviceIdHeaderOverride;
+        request += deviceIdHeader;
         request += "\r\n";
     }
     request += "\r\n";
@@ -100,8 +172,8 @@ namespace
 
     if (statusCode <= 0)
     {
-        Serial.print("[ApiClient] Error de conexion/TLS: ");
-        Serial.println("connection refused");
+        Serial.printf("[ApiClient] Respuesta invalida/sin respuesta del gateway (statusLine='%s')\n",
+                      statusLine.c_str());
         client.stop();
         return false;
     }

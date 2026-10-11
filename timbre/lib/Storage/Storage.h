@@ -8,8 +8,6 @@
 namespace Storage
 {
     // --- Identidad del dispositivo (namespace "device") ---
-    String loadDeviceId();
-    void saveDeviceId(const String &id);
     bool loadDeviceRegistered();
     void saveDeviceRegistered(bool registered);
 
@@ -17,4 +15,5 @@ namespace Storage
     void saveWifiCredentials(const String &ssid, const String &password);
     String loadWifiSSID();
     String loadWifiPassword();
+    void clearWifiCredentials();
 }

@@ -1,0 +1,95 @@
+diff --git a/timbre/lib/Config/Config.h b/timbre/lib/Config/Config.h
+index 6f784d7..e30580c 100644
+--- a/timbre/lib/Config/Config.h
++++ b/timbre/lib/Config/Config.h
+@@ -158,6 +158,10 @@ namespace Config
+         // Despues del press, cada cuanto se saca una foto, se pasa por el tiny
+         // model y, SOLO si hay persona, se manda al backend (capture_image).
+         constexpr uint32_t CAPTURE_INTERVAL_MS = 5000;
++        // Solo una foto en analisis a la vez: la proxima captura espera el
++        // ia_response IMAGE de la anterior (press o captura). Si no llega en
++        // este tiempo, se sigue igual para no cortar las capturas.
++        constexpr uint32_t CAPTURE_RESPONSE_TIMEOUT_MS = 30000;
+         // Mensajes de "progreso" en la Screen: solo salen si la pantalla estuvo
+         // quieta este tiempo (no pisan enseguida un resultado de la IA).
+         constexpr uint32_t PROGRESO_ESPERA_MS = 2500; // esperando la respuesta del press
+diff --git a/timbre/lib/EventFlow/EventFlow.cpp b/timbre/lib/EventFlow/EventFlow.cpp
+index cf3608a..258343b 100644
+--- a/timbre/lib/EventFlow/EventFlow.cpp
++++ b/timbre/lib/EventFlow/EventFlow.cpp
+@@ -88,6 +88,12 @@ namespace
+     unsigned long ultimoSonidoMs = 0;     // chequeo de mic
+     unsigned long ultimaCapturaMs = 0;    // foto cada CAPTURE_INTERVAL_MS
+ 
++    // Hay una foto (press o capture_image) esperando su ia_response IMAGE. No
++    // se manda otra hasta que llegue (o pase CAPTURE_RESPONSE_TIMEOUT_MS): asi
++    // las fotos no se acumulan en el gateway si el analisis tarda.
++    bool fotoEnAnalisis = false;
++    unsigned long fotoEnviadaMs = 0;
++
+     // Pico del nivel de microfono desde la ultima vez que se evaluo. level() es
+     // solo el RMS del ultimo chunk (20ms): si se lee espaciado, un sonido corto
+     // entre chequeos se pierde. loop() va acumulando el maximo y haySonido()
+@@ -298,6 +304,7 @@ namespace
+         respuestaImagen = false;
+         respuestaProcesada = false;
+         reintentandoPress = false;
++        fotoEnAnalisis = false;
+         media = Media::CERRADA;
+         falloMedia = false;
+         audioEnviando = false;
+@@ -377,7 +384,10 @@ namespace
+         mostrarEnScreen(r);
+ 
+         if (r.chunkType == "IMAGE")
++        {
+             respuestaImagen = true;
++            fotoEnAnalisis = false; // se puede mandar la proxima captura
++        }
+ 
+         if (r.isStopDanger())
+         {
+@@ -456,10 +466,20 @@ namespace
+     // --- Fotos al backend ------------------------------------------------------
+     // Cada CAPTURE_INTERVAL_MS: foto nueva -> tiny model -> se manda como
+     // capture_image SOLO si hay persona.
++    // Una sola foto en analisis a la vez: si la anterior (press o captura)
++    // todavia no tuvo su ia_response IMAGE, se espera. Si no llega en
++    // CAPTURE_RESPONSE_TIMEOUT_MS se sigue igual (para no cortar las capturas).
+     void capturaPeriodica()
+     {
+         if (millis() - ultimaCapturaMs < Config::Event::CAPTURE_INTERVAL_MS)
+             return;
++        if (fotoEnAnalisis)
++        {
++            if (millis() - fotoEnviadaMs < Config::Event::CAPTURE_RESPONSE_TIMEOUT_MS)
++                return; // todavia se esta analizando la anterior
++            Serial.println("[FLOW] sin ia_response de la foto anterior: sigo con las capturas");
++            fotoEnAnalisis = false;
++        }
+         ultimaCapturaMs = millis();
+         ultimaEvaluacionMs = millis(); // ya corre el tiny model aca
+ 
+@@ -470,7 +490,11 @@ namespace
+         }
+         marcarPersona();
+         if (BackendSession::enviarCaptura(trackId, foto, fotoLen))
++        {
++            fotoEnAnalisis = true;
++            fotoEnviadaMs = millis();
+             Serial.printf("[FLOW] capture_image enviada (%u bytes)\n", (unsigned)fotoLen);
++        }
+         else
+             Serial.println("[FLOW] no se pudo enviar la capture_image");
+     }
+@@ -722,6 +746,10 @@ namespace EventFlow
+                     ultimaEvaluacionMs = millis();
+                     ultimoSonidoMs = millis();
+                     ultimaCapturaMs = millis();
++                    // La foto del press tambien cuenta: la primera captura
++                    // espera su respuesta.
++                    fotoEnAnalisis = true;
++                    fotoEnviadaMs = millis();
+                 }
+                 else
+                 {

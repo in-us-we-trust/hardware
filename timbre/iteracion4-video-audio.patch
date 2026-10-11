@@ -1,0 +1,354 @@
+diff --git a/timbre/lib/AudioSource/AudioSource.cpp b/timbre/lib/AudioSource/AudioSource.cpp
+index 01422b2..390d7af 100644
+--- a/timbre/lib/AudioSource/AudioSource.cpp
++++ b/timbre/lib/AudioSource/AudioSource.cpp
+@@ -74,8 +74,10 @@ bool AudioSource::begin()
+         .channel_format = I2S_CHANNEL_FMT_ONLY_RIGHT, // el mic del XIAO S3 esta en el canal RIGHT
+         .communication_format = I2S_COMM_FORMAT_STAND_I2S,
+         .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+-        .dma_buf_count = 8,
+-        .dma_buf_len = 256,
++        // 12 x 1024 muestras @16kHz = ~768 ms de colchon (24 KB de RAM interna).
++        // Antes 8 x 256 = 128 ms: cualquier vuelta mas lenta del loop perdia audio.
++        .dma_buf_count = 12,
++        .dma_buf_len = 1024,
+         .use_apll = false,
+         .tx_desc_auto_clear = false,
+         .fixed_mclk = 0};
+@@ -107,7 +109,8 @@ bool AudioSource::begin()
+     i2s_set_clk(I2S_PORT, 16000, I2S_BITS_PER_SAMPLE_16BIT, I2S_CHANNEL_MONO);
+ 
+     _pcmCount = 0;
+-    _chunkReady = false;
++    _qHead = 0;
++    _qCount = 0;
+     _level = 0;
+     _warmupUntilMs = millis() + MIC_WARMUP_MS;
+     _ready = true;
+@@ -126,7 +129,8 @@ void AudioSource::end()
+     {
+         i2s_driver_uninstall(I2S_PORT);
+         _ready = false;
+-        _chunkReady = false;
++        _qHead = 0;
++        _qCount = 0;
+         _pcmCount = 0;
+         _level = 0;
+         Serial.println("[MIC] apagado");
+@@ -142,29 +146,34 @@ void AudioSource::loop()
+     if (!_ready)
+         return;
+ 
+-    int16_t tmpBuf[256];
+-    size_t bytesRead = 0;
+-    esp_err_t err = i2s_read(I2S_PORT, tmpBuf, sizeof(tmpBuf), &bytesRead, 0);
+-    if (err != ESP_OK || bytesRead == 0)
+-        return;
+-
+-    size_t samplesRead = bytesRead / sizeof(int16_t);
+-
+-    // El mic PDM tiene un offset DC (~1300). Lo estimamos con un promedio movil
+-    // y lo restamos, asi el audio queda centrado en 0 antes de amplificar.
++    // Drenar TODO lo que haya en el DMA (antes se leian max 256 muestras =
++    // 16 ms por vuelta y el resto se perdia). Tope de iteraciones por las dudas.
++    static int16_t tmpBuf[512];
+     static float dcOffset = 1300.0f;
+-    bool warmup = (long)(millis() - _warmupUntilMs) < 0;
+-    for (size_t i = 0; i < samplesRead; i++)
++    for (int iter = 0; iter < 64; iter++)
+     {
+-        dcOffset += (tmpBuf[i] - dcOffset) * 0.001f; // seguimiento lento del DC
+-        if (warmup)
+-            continue; // descartamos, pero el DC ya va convergiendo
+-        int16_t centered = (int16_t)(tmpBuf[i] - dcOffset);
+-        _pcmBuf[_pcmCount++] = applyGain(centered);
+-        if (_pcmCount >= AUDIO_PCM_SAMPLES_PER_CHUNK)
++        size_t bytesRead = 0;
++        esp_err_t err = i2s_read(I2S_PORT, tmpBuf, sizeof(tmpBuf), &bytesRead, 0);
++        if (err != ESP_OK || bytesRead == 0)
++            break;
++
++        size_t samplesRead = bytesRead / sizeof(int16_t);
++
++        // El mic PDM tiene un offset DC (~1300). Lo estimamos con un promedio movil
++        // y lo restamos, asi el audio queda centrado en 0 antes de amplificar.
++        bool warmup = (long)(millis() - _warmupUntilMs) < 0;
++        for (size_t i = 0; i < samplesRead; i++)
+         {
+-            encodeChunk();
+-            _pcmCount = 0;
++            dcOffset += (tmpBuf[i] - dcOffset) * 0.001f; // seguimiento lento del DC
++            if (warmup)
++                continue; // descartamos, pero el DC ya va convergiendo
++            int16_t centered = (int16_t)(tmpBuf[i] - dcOffset);
++            _pcmBuf[_pcmCount++] = applyGain(centered);
++            if (_pcmCount >= AUDIO_PCM_SAMPLES_PER_CHUNK)
++            {
++                encodeChunk();
++                _pcmCount = 0;
++            }
+         }
+     }
+ #endif
+@@ -172,15 +181,25 @@ void AudioSource::loop()
+ 
+ void AudioSource::encodeChunk()
+ {
++    // Cola llena: descartamos el mas viejo (el consumidor no esta leyendo,
++    // p. ej. audio OFF). Mejor perder audio viejo que el reciente.
++    if (_qCount == AUDIO_QUEUE_CHUNKS)
++    {
++        _qHead = (_qHead + 1) % AUDIO_QUEUE_CHUNKS;
++        _qCount--;
++        _dropped++;
++    }
++    uint8_t *slot = _queue[(_qHead + _qCount) % AUDIO_QUEUE_CHUNKS];
++
+     uint64_t sumSq = 0;
+     for (int i = 0; i < AUDIO_CHUNK_SAMPLES; i++)
+     {
+         int16_t sample = _pcmBuf[i * 2];
+-        _ulawBuf[i] = pcm16_to_ulaw(sample);
++        slot[i] = pcm16_to_ulaw(sample);
+         sumSq += (int32_t)sample * (int32_t)sample;
+     }
+     _level = (uint16_t)sqrt((double)(sumSq / AUDIO_CHUNK_SAMPLES));
+-    _chunkReady = true;
++    _qCount++;
+ }
+ 
+ bool AudioSource::nextAudioChunk(const uint8_t **data, size_t *len)
+@@ -210,11 +229,12 @@ bool AudioSource::nextAudioChunk(const uint8_t **data, size_t *len)
+ 
+     return true;
+ #else
+-    if (!_chunkReady)
++    if (_qCount == 0)
+         return false;
+-    *data = _ulawBuf;
++    *data = _queue[_qHead];
+     *len = AUDIO_CHUNK_SAMPLES;
+-    _chunkReady = false;
++    _qHead = (_qHead + 1) % AUDIO_QUEUE_CHUNKS;
++    _qCount--;
+     return true;
+ #endif
+ }
+diff --git a/timbre/lib/AudioSource/AudioSource.h b/timbre/lib/AudioSource/AudioSource.h
+index 1b64a86..4919b41 100644
+--- a/timbre/lib/AudioSource/AudioSource.h
++++ b/timbre/lib/AudioSource/AudioSource.h
+@@ -20,6 +20,9 @@
+ #define AUDIO_CHUNK_SAMPLES 160
+ // Captura a 16kHz: necesitamos el doble de PCM samples para downsamplear a 8kHz
+ #define AUDIO_PCM_SAMPLES_PER_CHUNK (AUDIO_CHUNK_SAMPLES * 2)
++// Cola de chunks ya codificados entre loop() y el consumidor (RTSP): 40 x 20ms
++// = 800 ms. Si se llena, se descarta el mas viejo.
++#define AUDIO_QUEUE_CHUNKS 40
+ 
+ class AudioSource
+ {
+@@ -27,13 +30,15 @@ public:
+     bool begin();
+     void end();
+ 
+-    // Leer del buffer DMA y acumular. Llamar en cada vuelta del loop().
++    // DRENA todo el buffer DMA (no solo 16 ms) y encola chunks. Llamar en cada
++    // vuelta del loop(); el DMA (~768 ms) cubre vueltas lentas (p. ej. la
++    // inferencia del PersonDetector).
+     // En AUDIO_TEST_MODE no hace nada (nextAudioChunk sirve directo del array).
+     void loop();
+ 
+-    // Devuelve el ultimo chunk de audio codificado (G.711 u-law, 160 bytes).
+-    // data apunta a un buffer INTERNO; valido hasta el proximo loop().
+-    // Devuelve false si no hay chunk listo.
++    // Saca el chunk MAS VIEJO de la cola (G.711 u-law, 160 bytes), en orden.
++    // data apunta a un slot INTERNO; valido hasta el proximo loop().
++    // Devuelve false si la cola esta vacia. Llamar en un while para vaciarla.
+     bool nextAudioChunk(const uint8_t **data, size_t *len);
+ 
+     // Nivel de amplitud del ultimo chunk (RMS, 0..32767). Para la animacion
+@@ -44,14 +49,16 @@ public:
+ 
+ private:
+     bool _ready = false;
+-    bool _chunkReady = false;
+ 
+     // Buffer de acumulacion PCM (16kHz, 16-bit, mono)
+     int16_t _pcmBuf[AUDIO_PCM_SAMPLES_PER_CHUNK];
+     size_t _pcmCount = 0; // samples acumulados
+ 
+-    // Chunk codificado G.711 u-law (8kHz, 8-bit)
+-    uint8_t _ulawBuf[AUDIO_CHUNK_SAMPLES];
++    // Cola circular de chunks codificados G.711 u-law (8kHz, 8-bit)
++    uint8_t _queue[AUDIO_QUEUE_CHUNKS][AUDIO_CHUNK_SAMPLES];
++    size_t _qHead = 0;  // proximo a leer
++    size_t _qCount = 0; // chunks en cola
++    uint32_t _dropped = 0; // chunks descartados por cola llena
+ 
+     uint16_t _level = 0; // amplitud RMS del ultimo chunk
+     unsigned long _warmupUntilMs = 0; // hasta cuando se descarta el audio tras begin()
+diff --git a/timbre/lib/Config/Config.h b/timbre/lib/Config/Config.h
+index 83ad725..38a18bc 100644
+--- a/timbre/lib/Config/Config.h
++++ b/timbre/lib/Config/Config.h
+@@ -213,6 +213,8 @@ namespace Config
+         constexpr uint16_t PORT = MEDIAMTX_PORT;
+         constexpr const char *PATH = MEDIAMTX_PATH; // segmento del medio: {deviceId}/doorbell/{trackId}
+         constexpr const char *TLS_HOSTNAME = MEDIAMTX_TLS_HOSTNAME;
++        // Copia propia del frame que manda RtspPublisher (PSRAM). Mismo tope que MJPEG.
++        constexpr size_t FRAME_BUF_SIZE = 100 * 1024;
+         constexpr const char *USER = MEDIAMTX_USER;
+         constexpr const char *PASS = MEDIAMTX_PASS;
+     }
+diff --git a/timbre/lib/MediaSource/MediaSource.h b/timbre/lib/MediaSource/MediaSource.h
+index ef35959..6db7f88 100644
+--- a/timbre/lib/MediaSource/MediaSource.h
++++ b/timbre/lib/MediaSource/MediaSource.h
+@@ -1,5 +1,6 @@
+ #pragma once
+ #include <Arduino.h>
++#include <string.h>
+ 
+ // ---------------------------------------------------------------------------
+ // MediaSource: interfaz de la fuente de media que consume el RtspPublisher.
+@@ -28,6 +29,22 @@ public:
+     // Devuelve false si no hay frame disponible en este momento.
+     virtual bool nextVideoFrame(const uint8_t **data, size_t *len) = 0;
+ 
++    // Igual que nextVideoFrame pero COPIA el frame al buffer del caller.
++    // Usar esto cuando el envio es lento (RTSP/TLS): con nextVideoFrame el
++    // buffer interno puede ser pisado por otra captura (task MJPEG en el otro
++    // core) mientras se manda. Default: copia lo que da nextVideoFrame (sirve
++    // para fuentes sin concurrencia, como el mock). CameraSource lo hace bajo mutex.
++    virtual bool copyVideoFrame(uint8_t *dest, size_t destCap, size_t *outLen)
++    {
++        const uint8_t *data = nullptr;
++        size_t len = 0;
++        if (!nextVideoFrame(&data, &len) || len > destCap)
++            return false;
++        memcpy(dest, data, len);
++        *outLen = len;
++        return true;
++    }
++
+     // FPS objetivo del video (marca la cadencia con la que el publisher pide).
+     virtual int videoFps() const = 0;
+ 
+diff --git a/timbre/lib/RtspPublisher/RtspPublisher.cpp b/timbre/lib/RtspPublisher/RtspPublisher.cpp
+index 912f255..9885559 100644
+--- a/timbre/lib/RtspPublisher/RtspPublisher.cpp
++++ b/timbre/lib/RtspPublisher/RtspPublisher.cpp
+@@ -58,6 +58,16 @@ namespace
+ 
+     uint8_t pkt[MAX_RTP_PACKET + 8];
+ 
++    // Copia PROPIA del frame que se esta mandando (PSRAM). Antes se mandaba
++    // directo del buffer interno de CameraSource y el task MJPEG (otro core)
++    // lo pisaba a mitad del envio -> JPEG con el final roto en el gateway.
++    uint8_t *frameBuf = nullptr;
++    size_t frameCap = 0;
++
++    // Timestamp RTP de video = tiempo real desde que arranco el stream (90 kHz),
++    // no +1/fps fijo: si el loop va lento, el video no se "acelera".
++    unsigned long streamStartMs = 0;
++
+     // Sin credenciales en la URL: van en el header Authorization.
+     String rtspUrl()
+     {
+@@ -305,8 +315,7 @@ namespace
+         if ((j.width / 8) > 255 || (j.height / 8) > 255)
+             return;
+ 
+-        int fps = videoSrc->videoFps() > 0 ? videoSrc->videoFps() : 10;
+-        vTimestamp += 90000 / fps;
++        vTimestamp = (uint32_t)((millis() - streamStartMs) * 90UL);
+ 
+         const uint8_t *scan = jpeg + j.scanStart;
+         size_t remaining = j.scanLen;
+@@ -435,6 +444,17 @@ namespace RtspPublisher
+         vSsrc = esp_random();
+         aSsrc = esp_random();
+         tcp.setHandshakeTimeout(RTSP_TLS_HANDSHAKE_TIMEOUT_S);
++
++        if (!frameBuf)
++        {
++            frameCap = Config::Media::FRAME_BUF_SIZE;
++            frameBuf = (uint8_t *)(psramFound() ? ps_malloc(frameCap) : malloc(frameCap));
++            if (!frameBuf)
++            {
++                frameCap = 0;
++                Serial.println("[RTSP] sin memoria para el buffer de frame: video deshabilitado");
++            }
++        }
+         Serial.printf("[RTSP] configurado -> rtsps://%s:%d (user %s, tls-name %s, video %s, audio %s)\n",
+                       mtxHost.c_str(), Config::Media::PORT, user.c_str(),
+                       Config::Media::TLS_HOSTNAME,
+@@ -446,7 +466,7 @@ namespace RtspPublisher
+         mtxPath = path;
+         // Negociamos todos los tracks con fuente disponible; el envio arranca
+         // apagado y lo prende EventFlow cuando decide (deteccion).
+-        hasVideo = (videoSrc != nullptr);
++        hasVideo = (videoSrc != nullptr && frameBuf != nullptr);
+         hasAudio = (audioSrc != nullptr);
+         videoActivo = false;
+         audioActivo = false;
+@@ -625,6 +645,7 @@ namespace RtspPublisher
+             }
+             st = State::Publishing;
+             lastFrameMs = 0;
++            streamStartMs = millis();
+             Serial.println("[RTSP] LISTO para publicar (negociado: " +
+                            String(hasVideo ? "video" : "") +
+                            String(hasVideo && hasAudio ? " + " : "") +
+@@ -657,21 +678,26 @@ namespace RtspPublisher
+                 if (millis() - lastFrameMs >= interval)
+                 {
+                     lastFrameMs = millis();
+-                    const uint8_t *data;
+-                    size_t flen;
+-                    if (videoSrc->nextVideoFrame(&data, &flen))
+-                        sendVideoFrame(data, flen);
++                    size_t flen = 0;
++                    if (videoSrc->copyVideoFrame(frameBuf, frameCap, &flen))
++                        sendVideoFrame(frameBuf, flen);
+                 }
+             }
+ 
+-            // Audio: manda los chunks disponibles (cada 20ms hay uno). Idem:
+-            // negociado Y activado en vivo.
++            // Audio: manda TODOS los chunks encolados (AudioSource acumula lo que
++            // se junto mientras el loop estaba ocupado). Idem: negociado Y
++            // activado en vivo. Tope por vuelta para no monopolizar el loop.
+             if (hasAudio && audioActivo && audioSrc)
+             {
+                 const uint8_t *achunk;
+                 size_t alen;
+-                if (audioSrc->nextAudioChunk(&achunk, &alen))
++                int sent = 0;
++                while (st == State::Publishing && sent < 64 &&
++                       audioSrc->nextAudioChunk(&achunk, &alen))
++                {
+                     sendAudioChunk(achunk, alen);
++                    sent++;
++                }
+             }
+             break;
+         }
+diff --git a/timbre/lib/cameraSource/CameraSource.h b/timbre/lib/cameraSource/CameraSource.h
+index f5cc023..f4a50c6 100644
+--- a/timbre/lib/cameraSource/CameraSource.h
++++ b/timbre/lib/cameraSource/CameraSource.h
+@@ -27,6 +27,12 @@ public:
+     // el task MJPEG que necesita escribir al socket (lento) sin retener el mutex.
+     bool captureFrameCopy(uint8_t *dest, size_t destCap, size_t *outLen);
+ 
++    // MediaSource: copia bajo mutex (lo usa RtspPublisher).
++    bool copyVideoFrame(uint8_t *dest, size_t destCap, size_t *outLen) override
++    {
++        return captureFrameCopy(dest, destCap, outLen);
++    }
++
+     // Foto para el press / provisioning BLE (base64). Thread-safe.
+     String captureBase64();
+ 

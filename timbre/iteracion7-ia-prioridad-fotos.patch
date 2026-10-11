@@ -1,0 +1,172 @@
+diff --git a/timbre/lib/EventFlow/EventFlow.cpp b/timbre/lib/EventFlow/EventFlow.cpp
+index 4f10493..a7c9f9b 100644
+--- a/timbre/lib/EventFlow/EventFlow.cpp
++++ b/timbre/lib/EventFlow/EventFlow.cpp
+@@ -24,6 +24,8 @@
+ //   2. CONECTANDO       MQTT (mTLS).
+ //   3. ESPERANDO_IA     press con la foto (SIEMPRE, haya o no persona) y se
+ //                       espera el ia_response de esa IMAGE (siempre, sin timeout).
++//                       Mientras tanto se siguen sacando fotos y escuchando
++//                       localmente (tiny model + mic).
+ //   4. SIN_MEDIA        no hubo persona ni sonido: se siguen sacando fotos y
+ //                       analizando LOCALMENTE (sin volver a mandar el press).
+ //   5. ABRIENDO_MEDIA   hubo persona o sonido: se abre el RTSPS.
+@@ -200,9 +202,10 @@ namespace
+         ultimoMensajeMs = millis();
+     }
+ 
++    // Resultado LOCAL (tiny model / microfono). Nunca pisa uno de la IA.
+     void resultado(const String &texto, const String &severidad, const String &origen)
+     {
+-        Screen::showResult(texto, severidad, origen);
++        Screen::showResult(texto, severidad, origen, false);
+     }
+ 
+     const char *const ORIGEN_CAMARA = "Local - Camara";
+@@ -332,7 +335,7 @@ namespace
+             texto = "PELIGRO: " + texto;
+             sev = "PELIGROSO"; // un STOP_DANGER siempre queda fijo arriba
+         }
+-        resultado(texto, sev, "IA - " + etiquetaChunk(r.chunkType));
++        Screen::showResult(texto, sev, "IA - " + etiquetaChunk(r.chunkType), true);
+     }
+ 
+     void onRespuesta(const MqttClient::IaResponse &r)
+@@ -376,6 +379,28 @@ namespace
+         return true;
+     }
+ 
++    // ESPERANDO_IA: foto nueva + tiny model y chequeo de sonido. Se saca foto
++    // SIEMPRE (aunque ya se haya visto a alguien).
++    // TODO: en el futuro estas fotos tambien se mandan al backend.
++    void analizarMientrasEspera()
++    {
++        bool persona = hayPersonaEnFrame(); // captura un frame nuevo
++        bool sonido = haySonido();
++
++        if (persona && !videoDetectado)
++        {
++            videoDetectado = true;
++            resultado("Persona detectada en la puerta", "NORMAL", ORIGEN_CAMARA);
++            estado("Persona detectada. Esperando el analisis de la IA...");
++        }
++        if (sonido && !audioDetectado)
++        {
++            audioDetectado = true;
++            resultado("Se escucha a alguien en la puerta", "NORMAL", ORIGEN_MICROFONO);
++            estado("Se escucha a alguien. Esperando el analisis de la IA...");
++        }
++    }
++
+     // Abre el RTSP si hubo persona o sonido. Si no, analisis local.
+     void decidirMedia()
+     {
+@@ -515,6 +540,7 @@ namespace EventFlow
+                 {
+                     reintentandoPress = false;
+                     cambiarEstado(Backend::ESPERANDO_IA);
++                    ultimaEvaluacionMs = millis();
+                 }
+                 else
+                 {
+@@ -536,18 +562,24 @@ namespace EventFlow
+             break;
+ 
+         case Backend::ESPERANDO_IA:
+-            // Mientras llega la respuesta, se sigue escuchando: si aparece
+-            // sonido, cuenta para abrir el audio despues.
+-            if (!audioDetectado && haySonido())
+-                audioDetectado = true;
+-
+             // Se espera SIEMPRE la respuesta de la IMAGE (sin timeout): recien
+             // con ella se decide si abrir el stream.
+             if (respuestaImagen)
+             {
+                 decidirMedia();
++                break;
+             }
+-            else if (personaEnFoto)
++
++            // Mientras tanto se sigue analizando LOCALMENTE (fotos + mic) cada
++            // EVAL_INTERVAL_MS. Lo que se detecte cuenta para decidir que media
++            // abrir cuando llegue la respuesta.
++            if (millis() - ultimaEvaluacionMs >= Config::Event::EVAL_INTERVAL_MS)
++            {
++                ultimaEvaluacionMs = millis();
++                analizarMientrasEspera();
++            }
++
++            if (videoDetectado)
+             {
+                 progreso(PROGRESO_CON_PERSONA, Config::Event::PROGRESO_ESPERA_MS);
+             }
+diff --git a/timbre/lib/Screen/Screen.cpp b/timbre/lib/Screen/Screen.cpp
+index 86edb39..dc522d6 100644
+--- a/timbre/lib/Screen/Screen.cpp
++++ b/timbre/lib/Screen/Screen.cpp
+@@ -13,13 +13,15 @@ namespace
+ 
+   // --- Estado de la pantalla (para re-enviarlo si la pagina se reconecta) ---
+   // status: linea efimera (progreso / eventos locales).
+-  // card:   resultado FIJO. Solo lo reemplaza un resultado de severidad igual o
+-  //         mayor (gana el peor del evento).
++  // card:   resultado FIJO. La IA del backend siempre tiene prioridad sobre lo
++  //         local; entre resultados del mismo origen gana el de severidad
++  //         igual o mayor (el peor del evento).
+   struct Resultado
+   {
+     String text;
+     String sev;
+     String src;
++    bool esIA; // true: ia_response del backend. false: tiny model / microfono
+   };
+ 
+   String lastStatus = "";
+@@ -288,12 +290,21 @@ namespace Screen
+     pushStatus(text);
+   }
+ 
+-  void showResult(const String &text, const String &severity, const String &source)
++  void showResult(const String &text, const String &severity, const String &source, bool esIA)
+   {
+-    Resultado r{text, severity.length() ? severity : String("NORMAL"), source};
++    Resultado r{text, severity.length() ? severity : String("NORMAL"), source, esIA};
+ 
+-    // Tarjeta fija: solo si es igual o peor que la actual.
+-    bool fija = !hayCard || rango(r.sev) >= rango(card.sev);
++    // Tarjeta fija:
++    //  - IA sobre local: siempre reemplaza (aunque sea de menor severidad).
++    //  - local sobre IA: nunca.
++    //  - mismo origen: solo si es igual o peor que la actual.
++    bool fija;
++    if (!hayCard)
++      fija = true;
++    else if (r.esIA != card.esIA)
++      fija = r.esIA;
++    else
++      fija = rango(r.sev) >= rango(card.sev);
+     if (fija)
+     {
+       card = r;
+diff --git a/timbre/lib/Screen/Screen.h b/timbre/lib/Screen/Screen.h
+index 4da7069..55d8dc0 100644
+--- a/timbre/lib/Screen/Screen.h
++++ b/timbre/lib/Screen/Screen.h
+@@ -11,11 +11,14 @@ namespace Screen
+     void showStatus(const String &text);
+ 
+     // RESULTADO de un analisis (IA del backend o tiny model / microfono local).
+-    // Tarjeta fija arriba del video: solo cambia si la severidad es igual o
+-    // mayor a la que ya muestra (gana el peor del evento).
++    // Tarjeta fija arriba del video:
++    //   - un resultado de la IA (esIA=true) SIEMPRE tiene prioridad sobre uno
++    //     local: lo reemplaza, y un local nunca pisa a uno de la IA.
++    //   - entre resultados del mismo origen, solo cambia si la severidad es
++    //     igual o mayor (gana el peor del evento).
+     // Severidades: NORMAL < LLAMATIVO < SOSPECHOSO < PELIGROSO.
+     // source: de donde sale, p.ej. "IA - Imagen" o "Local - Camara".
+-    void showResult(const String &text, const String &severity, const String &source);
++    void showResult(const String &text, const String &severity, const String &source, bool esIA);
+ 
+     // Limpia estado y tarjeta (fin del evento).
+     void clear();

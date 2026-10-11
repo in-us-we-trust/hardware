@@ -27,6 +27,12 @@ public:
     // el task MJPEG que necesita escribir al socket (lento) sin retener el mutex.
     bool captureFrameCopy(uint8_t *dest, size_t destCap, size_t *outLen);
 
+    // MediaSource: copia bajo mutex (lo usa RtspPublisher).
+    bool copyVideoFrame(uint8_t *dest, size_t destCap, size_t *outLen) override
+    {
+        return captureFrameCopy(dest, destCap, outLen);
+    }
+
     // Foto para el press / provisioning BLE (base64). Thread-safe.
     String captureBase64();
 

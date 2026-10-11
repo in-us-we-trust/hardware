@@ -14,12 +14,6 @@ namespace
 
     BackendSession::RespuestaHandler respuestaHandler = nullptr;
 
-    String rtspUrl()
-    {
-        return String("rtsp://") + Config::Media::HOST + ":" + String(Config::Media::PORT) +
-               "/" + Config::Media::PATH;
-    }
-
     // Codifica bytes crudos a base64 (para el campo image del press, MQTT).
     String toBase64(const uint8_t *data, size_t len)
     {
@@ -40,8 +34,8 @@ namespace
         return result;
     }
 
-    // Se invoca con cada ia_response ya filtrado por deviceId (MqttClient).
-    // Aca filtramos por trackId y reenviamos a EventFlow.
+    // Se invoca con cada ia_response de este device (el topico ya es
+    // home/{deviceId}/...). Aca filtramos por trackId y reenviamos a EventFlow.
     void handleIaResponse(const MqttClient::IaResponse &r)
     {
         if (!active || r.trackId != trackId)
@@ -69,7 +63,8 @@ namespace BackendSession
         MqttClient::onIaResponse(handleIaResponse);
 
         // El stream RTSP (video + audio) tambien es transporte hacia el backend.
-        RtspPublisher::initialize(Config::Media::HOST, video, audio, Config::Media::PATH);
+        RtspPublisher::initialize(Config::Media::HOST, Config::Media::USER, Config::Media::PASS,
+                                  video, audio);
 
         Serial.println("[SESSION] configurada (MQTT + RTSP sin conectar aun)");
     }
@@ -105,7 +100,7 @@ namespace BackendSession
         // El trackId lo genera EventFlow; aca lo guardamos como sesion activa
         // (para filtrar ia_response) y lo usamos como eventId del press.
         trackId = id;
-        bool ok = MqttClient::publishPress(trackId, rtspUrl(), fotoBase64);
+        bool ok = MqttClient::publishPress(trackId, fotoBase64);
         if (!ok)
         {
             Serial.println("[SESSION] no se pudo publicar el press");
@@ -119,13 +114,49 @@ namespace BackendSession
         return true;
     }
 
-    bool iniciarMedia()
+    bool enviarCaptura(const String &id, const uint8_t *jpeg, size_t len)
     {
+        if (!active || id != trackId)
+            return false;
+        String fotoB64 = toBase64(jpeg, len);
+        if (fotoB64.length() == 0)
+        {
+            Serial.println("[SESSION] no se pudo codificar la captura");
+            return false;
+        }
+        return MqttClient::publishCaptureImage(trackId, fotoB64);
+    }
+
+    bool iniciarMedia(const String &id)
+    {
+        // Path que el gateway reconstruye: {RTSP_BASE}/{deviceId}/doorbell/{trackId}.
+        String path = deviceId + "/" + Config::Media::PATH + "/" + id;
         // Negocia todos los tracks disponibles; el envio arranca apagado.
-        bool ok = RtspPublisher::start();
+        bool ok = RtspPublisher::start(path);
         if (!ok)
             Serial.println("[SESSION] RTSP no arranco (el evento local sigue)");
         return ok;
+    }
+
+    void avisarInicioMedia(const String &id)
+    {
+        MqttClient::publishStreamStart(id);
+    }
+
+    void detenerMedia()
+    {
+        if (RtspPublisher::state() != RtspPublisher::State::Idle)
+            RtspPublisher::stop();
+    }
+
+    bool mediaLista()
+    {
+        return RtspPublisher::isPublishing();
+    }
+
+    bool mediaFallo()
+    {
+        return RtspPublisher::state() == RtspPublisher::State::Error;
     }
 
     void activarVideo(bool activo)
@@ -158,8 +189,11 @@ namespace BackendSession
     {
         MqttClient::loop();
 
-        // Mientras el stream publica, hay que bombearlo (manda video+audio RTP).
-        if (RtspPublisher::isPublishing())
+        // Bombear el RTSP en TODOS los estados activos: loop() es el que avanza
+        // ANNOUNCE -> SETUP -> RECORD y despues manda video+audio. (Antes solo se
+        // llamaba en Publishing y la negociacion quedaba trabada en Announcing.)
+        RtspPublisher::State s = RtspPublisher::state();
+        if (s != RtspPublisher::State::Idle && s != RtspPublisher::State::Error)
             RtspPublisher::loop();
     }
 

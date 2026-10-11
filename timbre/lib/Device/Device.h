@@ -2,16 +2,24 @@
 #include <Arduino.h>
 
 // ---------------------------------------------------------------------------
-// Device: identidad del dispositivo (UUID estable y nombre BLE derivado del
-// chip). Usa Storage para persistir el UUID entre reinicios.
+// Device: identidad del dispositivo y nombre BLE derivado del chip.
+//
+// El deviceId es FIJO (Config::Identity::ID, build flag DEVICE_ID) y tiene
+// que ser el CN del certificado del dispositivo: Mosquitto lo usa como
+// username y el ACL solo permite home/<CN>/#. Ya no se genera un UUID random.
 // ---------------------------------------------------------------------------
 namespace Device
 {
-    // Genera un UUID v4 nuevo (no lo persiste).
+    // Genera un UUID v4 nuevo (no lo persiste). Se usa para los trackId.
     String generateUUID();
 
-    // Devuelve el UUID persistido; si no existe, lo genera y lo guarda.
-    String getOrCreateDeviceId();
+    // deviceId del timbre (= CN del certificado).
+    String getDeviceId();
+
+    // true si el CN de DEVICE_CERT coincide con getDeviceId(). Si no coincide,
+    // loguea el error: el broker aceptaria la conexion pero el ACL descartaria
+    // todos los mensajes en silencio.
+    bool certMatchesDeviceId();
 
     // Nombre BLE/AP derivado del MAC del chip, ej: "TIMBRE-A1B2C3"
     String getBleName();

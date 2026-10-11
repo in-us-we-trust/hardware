@@ -20,6 +20,9 @@
 #define AUDIO_CHUNK_SAMPLES 160
 // Captura a 16kHz: necesitamos el doble de PCM samples para downsamplear a 8kHz
 #define AUDIO_PCM_SAMPLES_PER_CHUNK (AUDIO_CHUNK_SAMPLES * 2)
+// Cola de chunks ya codificados entre loop() y el consumidor (RTSP): 40 x 20ms
+// = 800 ms. Si se llena, se descarta el mas viejo.
+#define AUDIO_QUEUE_CHUNKS 40
 
 class AudioSource
 {
@@ -27,13 +30,15 @@ public:
     bool begin();
     void end();
 
-    // Leer del buffer DMA y acumular. Llamar en cada vuelta del loop().
+    // DRENA todo el buffer DMA (no solo 16 ms) y encola chunks. Llamar en cada
+    // vuelta del loop(); el DMA (~768 ms) cubre vueltas lentas (p. ej. la
+    // inferencia del PersonDetector).
     // En AUDIO_TEST_MODE no hace nada (nextAudioChunk sirve directo del array).
     void loop();
 
-    // Devuelve el ultimo chunk de audio codificado (G.711 u-law, 160 bytes).
-    // data apunta a un buffer INTERNO; valido hasta el proximo loop().
-    // Devuelve false si no hay chunk listo.
+    // Saca el chunk MAS VIEJO de la cola (G.711 u-law, 160 bytes), en orden.
+    // data apunta a un slot INTERNO; valido hasta el proximo loop().
+    // Devuelve false si la cola esta vacia. Llamar en un while para vaciarla.
     bool nextAudioChunk(const uint8_t **data, size_t *len);
 
     // Nivel de amplitud del ultimo chunk (RMS, 0..32767). Para la animacion
@@ -44,14 +49,16 @@ public:
 
 private:
     bool _ready = false;
-    bool _chunkReady = false;
 
     // Buffer de acumulacion PCM (16kHz, 16-bit, mono)
     int16_t _pcmBuf[AUDIO_PCM_SAMPLES_PER_CHUNK];
     size_t _pcmCount = 0; // samples acumulados
 
-    // Chunk codificado G.711 u-law (8kHz, 8-bit)
-    uint8_t _ulawBuf[AUDIO_CHUNK_SAMPLES];
+    // Cola circular de chunks codificados G.711 u-law (8kHz, 8-bit)
+    uint8_t _queue[AUDIO_QUEUE_CHUNKS][AUDIO_CHUNK_SAMPLES];
+    size_t _qHead = 0;  // proximo a leer
+    size_t _qCount = 0; // chunks en cola
+    uint32_t _dropped = 0; // chunks descartados por cola llena
 
     uint16_t _level = 0; // amplitud RMS del ultimo chunk
     unsigned long _warmupUntilMs = 0; // hasta cuando se descarta el audio tras begin()
