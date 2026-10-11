@@ -63,7 +63,7 @@ namespace
     WiFiClient &client = gw.https ? static_cast<WiFiClient &>(secureClient) : plainClient;
     String hostHeader = gw.host;
     String fullPath = gw.basePath + path;
-
+      
     Serial.printf("[ApiClient] POST %s://%s:%u%s\n", gw.https ? "https" : "http",
                   gw.host.c_str(), gw.port, fullPath.c_str());
 
@@ -107,12 +107,8 @@ namespace
     if (deviceIdHeader.length() == 0 && !gw.https)
         deviceIdHeader = Device::getDeviceId();
 
-    // k: [DEBUG] trazas temporales para ver qué request arma el cliente.
-    Serial.println("[ApiClient] -------- Request debug --------");
-    Serial.println("[ApiClient] path: " + fullPath);
-    Serial.println("[ApiClient] header Host: " + hostHeader);
-    Serial.println("[ApiClient] header Content-Type: application/json");
     if (deviceIdHeader.length() > 0)
+
     {
         Serial.println("[ApiClient] header X-Device-ID: " + deviceIdHeader);
     }
@@ -120,10 +116,6 @@ namespace
     {
         Serial.println("[ApiClient] header X-Device-ID: <no enviado>");
     }
-
-    Serial.println("[ApiClient] body:");
-    Serial.println(jsonBody);
-    Serial.println("[ApiClient] --------------------------------");
 
     String request;
     request.reserve(jsonBody.length() + 256);
@@ -238,10 +230,6 @@ namespace ApiClient
         String jsonBody;
         serializeJson(doc, jsonBody);
 
-        //  trazas temporales del body final que sale a /devices.
-        Serial.println("[ApiClient] body final /devices:");
-        Serial.println(jsonBody);
-
         return doPost(Config::Api::PATH_DEVICES, jsonBody, responseBody, true);
     }
 
@@ -249,13 +237,7 @@ namespace ApiClient
                    const String &imageBase64,
                    String *responseBody)
     {
-        // Armado manual (sin ArduinoJson) para no duplicar en RAM el base64
-        // de la imagen.
         String jsonBody = "{\"type\":\"" + type + "\",\"image\":\"" + imageBase64 + "\"}";
-
-        // trazas temporales del body final que sale a /events.
-        Serial.println("[ApiClient] body final /events:");
-        Serial.println(jsonBody);
 
         return doPost(Config::Api::PATH_EVENTS, jsonBody, responseBody, false);
     }

@@ -6,9 +6,8 @@
 // MediaSource: interfaz de la fuente de media que consume el RtspPublisher.
 // Desacopla "de donde salen los bytes" de "como se publican por RTSP".
 //
-// Implementaciones intercambiables:
-//   - MockMediaSource   -> JPEG/WAV embebidos (desarrollo, Wokwi, sin hardware)
-//   - CameraMediaSource -> OV2640 + mic PDM reales (fase C, con la XIAO)
+// La implementacion de video actual es CameraSource. El audio se administra
+// por separado mediante AudioSource.
 //
 // El RtspPublisher habla SIEMPRE con esta interfaz y no sabe cual esta enchufada.
 // Es una interfaz (clase abstracta), no un namespace, justamente porque hay
@@ -20,7 +19,7 @@ class MediaSource
 public:
     virtual ~MediaSource() {}
 
-    // Prepara la fuente (abrir camara, cargar el mock, etc.). true si ok.
+    // Prepara la fuente. true si ok.
     virtual bool begin() = 0;
 
     // Entrega el proximo frame de VIDEO como JPEG.
