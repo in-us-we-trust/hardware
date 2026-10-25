@@ -38,88 +38,175 @@ namespace
 <meta name='viewport' content='width=device-width,initial-scale=1'>
 <title>Timbre</title>
 <style>
-body{font-family:system-ui,Arial;margin:0;background:#0f1115;color:#e6e6e6;}
-header{padding:16px 20px;background:#171a21;font-size:18px;font-weight:600;
- border-bottom:1px solid #262b36;display:flex;justify-content:space-between;
- align-items:center;gap:12px;}
-#status{font-size:13px;color:#8a90a0;font-weight:400;}
-#hangup{background:#e5484d;color:#fff;border:0;border-radius:8px;
- padding:8px 16px;font-size:14px;font-weight:600;cursor:pointer;}
-#hangup:hover{background:#c93b40;}
-main{padding:16px 20px;display:flex;flex-direction:column;gap:16px;
- max-width:720px;margin:0 auto;}
-#video{width:100%;border-radius:10px;background:#000;display:block;
- aspect-ratio:4/3;object-fit:contain;}
-#novideo{color:#6a7080;text-align:center;padding:40px;background:#171a21;
- border-radius:10px;display:none;}
-#viz{width:100%;height:48px;display:block;}
-#statusline{font-size:18px;color:#a8aebd;padding:12px 16px;background:#171a21;
- border-radius:8px;min-height:18px;display:flex;align-items:center;gap:8px;}
-#statusline .dot{width:10px;height:10px;border-radius:50%;background:#6a7080;
- flex:none;animation:pulse 1.2s ease-in-out infinite;}
-@keyframes pulse{0%,100%{opacity:.3}50%{opacity:1}}
-#card{padding:14px 16px;border-radius:10px;background:#1b1f28;
- border-left:6px solid #3a3f4b;font-size:17px;font-weight:600;white-space:pre-wrap;}
-#card .t{font-size:12px;color:#8a90a0;font-weight:400;margin-bottom:4px;}
-#card.sev-PELIGROSO{border-left-color:#e5484d;background:#3a1618;}
-#card.sev-SOSPECHOSO{border-left-color:#f5a623;}
-#card.sev-LLAMATIVO{border-left-color:#f2d600;}
-#card.sev-NORMAL{border-left-color:#30a46c;}
-#empty{color:#6a7080;padding:20px;}
+*{box-sizing:border-box;}
+body{font-family:system-ui,-apple-system,'Segoe UI',Arial;margin:0;
+ background:#f4f2f8;color:#1c1b22;}
+header{background:#fff;border-bottom:1px solid #e8e5ef;}
+.bar{max-width:864px;margin:0 auto;padding:12px 16px;display:flex;
+ justify-content:space-between;align-items:center;gap:12px;min-height:64px;}
+.brand{display:flex;align-items:center;gap:10px;font-size:18px;font-weight:700;}
+.logo{width:32px;height:32px;border-radius:8px;display:grid;place-items:center;
+ background:linear-gradient(135deg,#6e56cf,#5a43b8);color:#fff;}
+#hangup{display:none;align-items:center;gap:8px;background:#ef4444;color:#fff;
+ border:0;border-radius:10px;padding:9px 18px;font-size:15px;font-weight:600;
+ cursor:pointer;box-shadow:0 4px 14px rgba(239,68,68,.35);}
+#hangup:hover{background:#dc2626;}
+body.live #hangup{display:flex;}
+main{max-width:864px;margin:0 auto;padding:28px 16px;display:flex;
+ flex-direction:column;gap:16px;}
+#banner{display:flex;align-items:center;gap:14px;padding:14px 20px;
+ border-radius:14px;background:#fff;border:1px solid #e8e5ef;}
+#banner .dot{width:12px;height:12px;border-radius:50%;background:#a19dab;flex:none;}
+#banner .txt{flex:1;min-width:0;}
+#btitle{font-size:16px;font-weight:600;}
+#bsub{font-size:13px;color:#6f6b7a;margin-top:2px;}
+#timer{display:none;font-size:13px;font-weight:700;font-variant-numeric:tabular-nums;}
+body.live #banner{background:#dff1e8;border-color:#b9e2cc;color:#0b5b37;}
+body.live #banner .dot{background:#16a34a;animation:pulse 1.4s ease-in-out infinite;}
+body.live #bsub{color:#15704a;}
+body.live #timer{display:block;}
+@keyframes pulse{0%,100%{opacity:.45}50%{opacity:1}}
+#panel{background:#fff;border:1px solid #e8e5ef;border-radius:18px;overflow:hidden;
+ box-shadow:0 6px 24px rgba(40,30,80,.06);}
+#stage{display:none;position:relative;background:#22212b;}
+body.live #stage{display:block;}
+#video{width:100%;display:block;aspect-ratio:4/3;object-fit:contain;}
+.badge{position:absolute;top:14px;padding:5px 10px;border-radius:8px;
+ background:rgba(10,10,14,.85);color:#fff;font-size:12px;font-weight:600;
+ display:flex;align-items:center;gap:6px;}
+.badge.l{left:14px;letter-spacing:.06em;}
+.badge.r{right:14px;}
+.badge .rec{width:7px;height:7px;border-radius:50%;background:#ef4444;
+ animation:pulse 1.2s ease-in-out infinite;}
+#viz{position:absolute;left:0;right:0;bottom:0;width:100%;height:48px;
+ display:block;pointer-events:none;}
+#empty{display:flex;flex-direction:column;align-items:center;justify-content:center;
+ text-align:center;padding:24px;min-height:min(466px,70vw);}
+body.live #empty{display:none;}
+.eicon{width:84px;height:84px;border-radius:20px;background:#ede8f7;
+ color:#6e56cf;display:grid;place-items:center;margin-bottom:18px;}
+#empty h2{margin:0;font-size:18px;font-weight:700;}
+#empty p{margin:6px 0 0;font-size:14px;color:#6f6b7a;}
+#result{display:none;align-items:center;gap:14px;padding:18px 20px;}
+#result.on{display:flex;}
+body:not(.live) #result.on{border-top:1px solid #e8e5ef;}
+.ricon{width:42px;height:42px;border-radius:10px;background:#ede8f7;
+ color:#6e56cf;display:grid;place-items:center;flex:none;}
+#result .txt{flex:1;min-width:0;}
+#rtext{font-size:17px;font-weight:600;white-space:pre-wrap;overflow-wrap:anywhere;}
+#rmeta{font-size:13px;color:#6f6b7a;margin-top:2px;}
+#sev{flex:none;display:flex;align-items:center;gap:6px;padding:5px 12px;
+ border-radius:999px;font-size:12px;font-weight:700;letter-spacing:.06em;}
+#sev::before{content:'';width:6px;height:6px;border-radius:50%;background:currentColor;}
+.sev-NORMAL{background:#dff1e8;color:#15803d;}
+.sev-LLAMATIVO{background:#fdf4c7;color:#a16207;}
+.sev-SOSPECHOSO{background:#ffe8d1;color:#c2410c;}
+.sev-PELIGROSO{background:#fde2e2;color:#dc2626;}
+#result.p-PELIGROSO .ricon{background:#fde2e2;color:#dc2626;}
+@media (max-width:520px){
+ #result{flex-wrap:wrap;} #sev{margin-left:56px;}
+}
 </style></head><body>
-<header>
-  <span>Timbre <span id='status'></span></span>
-  <button id='hangup'>Colgar</button>
-</header>
+<header><div class='bar'>
+  <div class='brand'>
+    <span class='logo'><svg width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2.2' stroke-linecap='round'><rect x='6' y='2' width='12' height='20' rx='3'/><circle cx='12' cy='14' r='1.2' fill='currentColor'/><path d='M12 7v2'/></svg></span>
+    Timbre
+  </div>
+  <button id='hangup'><svg width='18' height='18' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M10.68 13.31a16 16 0 0 0 3.41 2.6l1.27-1.27a2 2 0 0 1 2.11-.45 12.84 12.84 0 0 0 2.81.7 2 2 0 0 1 1.72 2v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.42 19.42 0 0 1-3.33-2.67m-2.67-3.34a19.79 19.79 0 0 1-3.07-8.63A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72 12.84 12.84 0 0 0 .7 2.81 2 2 0 0 1-.45 2.11L8.09 9.91'/><path d='M22 2 2 22'/></svg>Colgar</button>
+</div></header>
 <main>
-  <div id='card'><div id='empty'>Sin analisis todavia</div></div>
-  <img id='video' alt='stream'>
-  <div id='novideo'>Sin video (timbre en reposo)</div>
-  <canvas id='viz' height='48'></canvas>
-  <div id='statusline'><span class='dot'></span><span id='statustext'>Timbre en reposo</span></div>
+  <div id='banner'>
+    <span class='dot'></span>
+    <div class='txt'><div id='btitle'>Timbre en reposo</div><div id='bsub'></div></div>
+    <span id='timer'>00:00</span>
+  </div>
+  <div id='panel'>
+    <div id='stage'>
+      <img id='video' alt=''>
+      <span class='badge l'><span class='rec'></span>EN VIVO</span>
+      <span class='badge r'>C&aacute;mara &middot; Local</span>
+      <canvas id='viz' height='48'></canvas>
+    </div>
+    <div id='empty'>
+      <div class='eicon'><svg width='40' height='40' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'><path d='M10.66 6H14a2 2 0 0 1 2 2v2.5l5.25-3.06A.5.5 0 0 1 22 7.87v8.26'/><path d='M16 16a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h2'/><path d='m2 2 20 20'/></svg></div>
+      <h2>Sin video</h2>
+      <p>La c&aacute;mara est&aacute; en reposo. Todav&iacute;a no hay an&aacute;lisis.</p>
+    </div>
+    <div id='result'>
+      <span class='ricon'><svg width='20' height='20' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><circle cx='12' cy='8' r='4'/><path d='M4 21a8 8 0 0 1 16 0'/></svg></span>
+      <div class='txt'><div id='rtext'></div><div id='rmeta'></div></div>
+      <span id='sev'></span>
+    </div>
+  </div>
 </main>
 <script>
 var host = location.hostname;
 var img = document.getElementById('video');
-var novideo = document.getElementById('novideo');
+var live = false;
+var statusText = '';
+var liveSince = 0;
+
+function $(id){ return document.getElementById(id); }
+
+// Banner de arriba: el titulo depende de si hay video; el subtitulo es la
+// linea de estado efimera que manda el ESP32 (o un texto por defecto).
+function renderBanner(){
+  $('btitle').textContent = live ? 'Transmitiendo video' : 'Timbre en reposo';
+  $('bsub').textContent = statusText || (live
+    ? 'An\u00e1lisis en vivo en curso\u2026'
+    : 'Se activar\u00e1 cuando alguien toque el timbre o se detecte movimiento.');
+}
+function setLive(on){
+  if(on === live) return;
+  live = on;
+  liveSince = Date.now();
+  document.body.classList.toggle('live', on);
+  if(on) resizeViz();
+  renderBanner(); tick();
+}
+function tick(){
+  var s = live ? Math.floor((Date.now() - liveSince) / 1000) : 0;
+  var mm = Math.floor(s / 60), ss = s % 60;
+  $('timer').textContent = (mm < 10 ? '0' : '') + mm + ':' + (ss < 10 ? '0' : '') + ss;
+}
+setInterval(tick, 1000);
+renderBanner();
 
 // --- Video: MJPEG continuo desde :8081 ---
 var streamUrl = 'http://' + host + ':8081/';
 img.src = streamUrl;
-img.onload = function(){ img.style.display='block'; novideo.style.display='none'; };
-img.onerror = function(){ img.style.display='none'; novideo.style.display='block'; };
+img.onload = function(){ setLive(true); };
+img.onerror = function(){ setLive(false); };
 
 // Retry: si el stream se corto (hangup) y vuelve (nuevo timbre), reconectar.
 setInterval(function(){
-  if(img.style.display==='none'){
+  if(!live){
     img.src = '';
     img.src = streamUrl + '?t=' + Date.now();
   }
 }, 2000);
 
 // --- Colgar: /hangup esta en :80 (mismo origen, sin CORS) ---
-document.getElementById('hangup').onclick = function(){
-  fetch('/hangup').then(function(){
-    img.style.display='none'; novideo.style.display='block';
-  }).catch(function(){});
+$('hangup').onclick = function(){
+  fetch('/hangup').then(function(){ setLive(false); }).catch(function(){});
 };
 
 // --- Mensajes (SSE) ---
-// card: resultado fijo arriba del video (lo decide el ESP32: gana el de mayor
-// severidad del evento). status: lo que se esta haciendo, abajo, sin colores.
+// card: resultado fijo debajo del video (lo decide el ESP32: gana el de mayor
+// severidad del evento). status: lo que se esta haciendo, en el banner.
 function setCard(o){
-  var c=document.getElementById('card');
-  c.className='sev-'+(o.sev||'NORMAL'); c.innerHTML='';
-  var h=document.createElement('div'); h.className='t';
-  h.textContent=new Date().toLocaleTimeString()+' \u00b7 '+(o.src||'')+' \u00b7 '+(o.sev||'NORMAL');
-  var b=document.createElement('div'); b.textContent=o.text||'';
-  c.appendChild(h); c.appendChild(b);
+  var sev = o.sev || 'NORMAL';
+  var r = $('result');
+  r.className = 'on p-' + sev;
+  $('rtext').textContent = o.text || '';
+  $('rmeta').textContent = new Date().toLocaleTimeString() +
+    (o.src ? ' \u00b7 ' + o.src.replace(/\s*-\s*/g, ' \u00b7 ') : '');
+  var b = $('sev'); b.className = 'sev-' + sev; b.textContent = sev;
 }
-function setStatus(t){ document.getElementById('statustext').textContent=t; }
+function setStatus(t){ statusText = t; renderBanner(); }
 function limpiar(){
-  setStatus('Timbre en reposo');
-  var c=document.getElementById('card'); c.className='';
-  c.innerHTML='<div id="empty">Sin analisis todavia</div>';
+  setStatus('');
+  $('result').className = '';
 }
 var es=new EventSource('/events');
 es.onmessage=function(e){
@@ -139,7 +226,7 @@ var targetLevel=0;   // ultimo nivel recibido (0..32767)
 var smooth=0;        // nivel suavizado para que no salte brusco
 var NBARS=32;
 var bars=new Array(NBARS).fill(0);
-function resizeViz(){ viz.width=viz.clientWidth; }
+function resizeViz(){ if(viz.clientWidth) viz.width=viz.clientWidth; }
 resizeViz(); window.addEventListener('resize',resizeViz);
 function drawViz(){
   // suavizado exponencial hacia el target
@@ -158,8 +245,7 @@ function drawViz(){
   vctx.clearRect(0,0,w,h);
   for(var i=0;i<NBARS;i++){
     var bh=Math.max(2, bars[i]*h);
-    var g=Math.round(48+bars[i]*160);
-    vctx.fillStyle='rgb('+Math.round(bars[i]*120)+','+g+',108)';
+    vctx.fillStyle='rgba(167,146,240,'+(0.25+bars[i]*0.6).toFixed(2)+')';
     vctx.fillRect(i*bw+1, (h-bh)/2, bw-2, bh);
   }
   requestAnimationFrame(drawViz);
