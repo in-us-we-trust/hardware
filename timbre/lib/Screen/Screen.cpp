@@ -55,15 +55,13 @@ body.live #hangup{display:flex;}
 main{max-width:864px;margin:0 auto;padding:28px 16px;display:flex;
  flex-direction:column;gap:16px;}
 #banner{display:flex;align-items:center;gap:14px;padding:14px 20px;
- border-radius:14px;background:#fff;border:1px solid #e8e5ef;}
+ border-top:1px solid #e8e5ef;}
 #banner .dot{width:12px;height:12px;border-radius:50%;background:#a19dab;flex:none;}
 #banner .txt{flex:1;min-width:0;}
 #btitle{font-size:16px;font-weight:600;}
 #bsub{font-size:13px;color:#6f6b7a;margin-top:2px;}
 #timer{display:none;font-size:13px;font-weight:700;font-variant-numeric:tabular-nums;}
-body.live #banner{background:#dff1e8;border-color:#b9e2cc;color:#0b5b37;}
-body.live #banner .dot{background:#16a34a;animation:pulse 1.4s ease-in-out infinite;}
-body.live #bsub{color:#15704a;}
+body.live #banner .dot{animation:pulse 1.4s ease-in-out infinite;}
 body.live #timer{display:block;}
 @keyframes pulse{0%,100%{opacity:.45}50%{opacity:1}}
 #panel{background:#fff;border:1px solid #e8e5ef;border-radius:18px;overflow:hidden;
@@ -87,22 +85,25 @@ body.live #empty{display:none;}
  color:#6e56cf;display:grid;place-items:center;margin-bottom:18px;}
 #empty h2{margin:0;font-size:18px;font-weight:700;}
 #empty p{margin:6px 0 0;font-size:14px;color:#6f6b7a;}
-#result{display:none;align-items:center;gap:14px;padding:18px 20px;}
+#result{display:none;align-items:center;gap:14px;padding:14px 20px;
+ border-radius:14px;background:#fff;border:1px solid #e8e5ef;}
 #result.on{display:flex;}
-body:not(.live) #result.on{border-top:1px solid #e8e5ef;}
-.ricon{width:42px;height:42px;border-radius:10px;background:#ede8f7;
- color:#6e56cf;display:grid;place-items:center;flex:none;}
+/* Color de la tarjeta segun severidad: verde / amarillo / rojo */
+#result.p-NORMAL{background:#dff1e8;border-color:#b9e2cc;color:#0b5b37;}
+#result.p-LLAMATIVO,#result.p-SOSPECHOSO{background:#fdf4c7;border-color:#f3e08f;color:#713f12;}
+#result.p-PELIGROSO{background:#fde2e2;border-color:#f6bcbc;color:#7f1d1d;}
+.ricon{width:42px;height:42px;border-radius:10px;background:rgba(255,255,255,.6);
+ color:inherit;display:grid;place-items:center;flex:none;}
 #result .txt{flex:1;min-width:0;}
 #rtext{font-size:17px;font-weight:600;white-space:pre-wrap;overflow-wrap:anywhere;}
-#rmeta{font-size:13px;color:#6f6b7a;margin-top:2px;}
+#rmeta{font-size:13px;opacity:.75;margin-top:2px;}
 #sev{flex:none;display:flex;align-items:center;gap:6px;padding:5px 12px;
- border-radius:999px;font-size:12px;font-weight:700;letter-spacing:.06em;}
+ border-radius:999px;font-size:12px;font-weight:700;letter-spacing:.06em;
+ background:rgba(255,255,255,.6);}
 #sev::before{content:'';width:6px;height:6px;border-radius:50%;background:currentColor;}
-.sev-NORMAL{background:#dff1e8;color:#15803d;}
-.sev-LLAMATIVO{background:#fdf4c7;color:#a16207;}
-.sev-SOSPECHOSO{background:#ffe8d1;color:#c2410c;}
-.sev-PELIGROSO{background:#fde2e2;color:#dc2626;}
-#result.p-PELIGROSO .ricon{background:#fde2e2;color:#dc2626;}
+.sev-NORMAL{color:#15803d;}
+.sev-LLAMATIVO,.sev-SOSPECHOSO{color:#a16207;}
+.sev-PELIGROSO{color:#dc2626;}
 @media (max-width:520px){
  #result{flex-wrap:wrap;} #sev{margin-left:56px;}
 }
@@ -115,10 +116,10 @@ body:not(.live) #result.on{border-top:1px solid #e8e5ef;}
   <button id='hangup'><svg width='18' height='18' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M10.68 13.31a16 16 0 0 0 3.41 2.6l1.27-1.27a2 2 0 0 1 2.11-.45 12.84 12.84 0 0 0 2.81.7 2 2 0 0 1 1.72 2v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.42 19.42 0 0 1-3.33-2.67m-2.67-3.34a19.79 19.79 0 0 1-3.07-8.63A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72 12.84 12.84 0 0 0 .7 2.81 2 2 0 0 1-.45 2.11L8.09 9.91'/><path d='M22 2 2 22'/></svg>Colgar</button>
 </div></header>
 <main>
-  <div id='banner'>
-    <span class='dot'></span>
-    <div class='txt'><div id='btitle'>Timbre en reposo</div><div id='bsub'></div></div>
-    <span id='timer'>00:00</span>
+  <div id='result'>
+    <span class='ricon'><svg width='20' height='20' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><circle cx='12' cy='8' r='4'/><path d='M4 21a8 8 0 0 1 16 0'/></svg></span>
+    <div class='txt'><div id='rtext'></div><div id='rmeta'></div></div>
+    <span id='sev'></span>
   </div>
   <div id='panel'>
     <div id='stage'>
@@ -132,10 +133,10 @@ body:not(.live) #result.on{border-top:1px solid #e8e5ef;}
       <h2>Sin video</h2>
       <p>La c&aacute;mara est&aacute; en reposo. Todav&iacute;a no hay an&aacute;lisis.</p>
     </div>
-    <div id='result'>
-      <span class='ricon'><svg width='20' height='20' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><circle cx='12' cy='8' r='4'/><path d='M4 21a8 8 0 0 1 16 0'/></svg></span>
-      <div class='txt'><div id='rtext'></div><div id='rmeta'></div></div>
-      <span id='sev'></span>
+    <div id='banner'>
+      <span class='dot'></span>
+      <div class='txt'><div id='btitle'>Timbre en reposo</div><div id='bsub'></div></div>
+      <span id='timer'>00:00</span>
     </div>
   </div>
 </main>
@@ -192,8 +193,9 @@ $('hangup').onclick = function(){
 };
 
 // --- Mensajes (SSE) ---
-// card: resultado fijo debajo del video (lo decide el ESP32: gana el de mayor
-// severidad del evento). status: lo que se esta haciendo, en el banner.
+// card: resultado fijo arriba del video, coloreado por severidad (lo decide el
+// ESP32: gana el de mayor severidad del evento). status: lo que se esta
+// haciendo, en el banner neutro debajo del video.
 function setCard(o){
   var sev = o.sev || 'NORMAL';
   var r = $('result');
